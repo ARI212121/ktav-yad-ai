@@ -3,6 +3,7 @@
 קלט: תמונת גווני אפור בגובה 48 פיקסלים, רוחב משתנה.
 פלט: רצף הסתברויות תווים לאורך ציר הרוחב (רוחב/4 צעדי זמן).
 """
+import os
 import torch
 import torch.nn as nn
 
@@ -36,17 +37,53 @@ class CRNN(nn.Module):
         return self.fc(r)                # (B, T, num_classes)
 
 
-def save_checkpoint(path, model, charset, step=0, meta=None):
-    torch.save({"model": model.state_dict(), "charset": charset,
-                "step": step, "meta": meta or {}}, path)
+def save_checkpoint(path, model, charset, step=0, meta=None, training_state=None):
+    checkpoint = {"model": model.state_dict(), "charset": charset,
+                  "step": step, "meta": meta or {}}
+    if training_state is not None:
+        checkpoint["training_state"] = training_state
+    temporary = path + ".tmp"
+    try:
+        torch.save(checkpoint, temporary)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
 def load_checkpoint(path, num_classes, charset):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if ckpt.get("charset") != charset:
-        raise ValueError(f"charset mismatch in {path} — המודל אומן על מפת תווים שונה")
+    old_charset = ckpt.get("charset")
+    old_state = ckpt.get("model")
+    if not isinstance(old_charset, str) or not isinstance(old_state, dict):
+        raise ValueError(f"invalid checkpoint in {path}")
+    if old_charset != charset and not charset.startswith(old_charset):
+        raise ValueError(f"charset mismatch in {path}")
     model = CRNN(num_classes)
-    model.load_state_dict(ckpt["model"])
+    if old_charset == charset:
+        model.load_state_dict(old_state)
+    else:
+        expanded = model.state_dict()
+        for name, tensor in old_state.items():
+            if name == "fc.weight":
+                if (tensor.shape[1:] != expanded[name].shape[1:]
+                        or tensor.shape[0] != len(old_charset) + 1):
+                    raise ValueError(f"incompatible classifier in {path}")
+                expanded[name][:tensor.shape[0]].copy_(tensor)
+            elif name == "fc.bias":
+                if tensor.shape[0] != len(old_charset) + 1:
+                    raise ValueError(f"incompatible classifier in {path}")
+                expanded[name][:tensor.shape[0]].copy_(tensor)
+            elif name in expanded and tensor.shape == expanded[name].shape:
+                expanded[name].copy_(tensor)
+            else:
+                raise ValueError(f"incompatible model weights in {path}: {name}")
+        added_rows = len(old_charset) + 1
+        expanded["fc.weight"][added_rows:].zero_()
+        expanded["fc.bias"][added_rows:].fill_(-5.0)
+        model.load_state_dict(expanded)
+        ckpt["charset_upgraded_from"] = old_charset
+        ckpt["charset"] = charset
     return model, ckpt
 
 

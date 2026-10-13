@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ktav-yad-ai"
+version = "1.0.1"
+description = "Hebrew handwriting OCR with an automation-friendly command line interface"
+requires-python = ">=3.11"
+dependencies = [
+  "torch",
+  "numpy",
+  "pillow",
+  "pypdfium2",
+  "certifi",
+  "truststore",
+  "keyring",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller"]
+
+[project.scripts]
+OCRHE = "cli:main"
+
+[tool.setuptools]
+py-modules = [
+  "ai_correction",
+  "app",
+  "charset",
+  "cli",
+  "dataset",
+  "fixes",
+  "gates",
+  "infer",
+  "make_template",
+  "model",
+  "paths",
+  "postfix",
+  "records",
+  "segment",
+  "synth",
+  "train",
+]
+
+[tool.setuptools.data-files]
+"share/ktav-yad-ai/data" = [
+  "data/corpus_lite.txt",
+  "data/config.json",
+  "data/fixes_general.tsv",
+  "data/.lm_counts.pkl",
+  "data/.lm_bigrams.pkl",
+  "data/.lm_trigrams.pkl",
+]
+"share/ktav-yad-ai/models" = [
+  "models/base_synth.pt",
+  "models/general.pt",
+  "models/typed.pt",
+]

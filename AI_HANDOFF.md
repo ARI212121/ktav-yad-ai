@@ -15,8 +15,9 @@ An offline Hebrew **handwriting → text** system with a CRNN+CTC optical model
 fine-tuning with **regression-gated** training (a new model is saved only if it
 beats the old one on a fixed held-out set), a statistical **language-model
 post-corrector** (word counts + bigrams + trigrams over a 2.5M-line rabbinic
-Hebrew corpus, driving a beam-search line reranker), a browser GUI (local HTTP
-server), and a PyInstaller EXE for mass distribution that ships with an **empty
+Hebrew corpus, driving a beam-search line reranker), a desktop GUI (local HTTP
+server + standalone Edge/Chrome app window by default, optional Qt WebEngine), and a PyInstaller
+one-file EXE for mass distribution that ships with an **empty
 personal profile** and grows via a self-learning correction loop. A separate
 **typed-text/screenshot** optical model handles printed text. Hardware target:
 i5-9500, 16GB RAM, **no GPU** — but the code auto-detects CUDA and serves both
@@ -104,22 +105,30 @@ Current measured results (CER = character error rate, lower is better):
   Auto CUDA detection.
 
 **App, packaging, data collection**
-- `app.py` — stdlib `ThreadingHTTPServer` on 127.0.0.1:8765 (port fallback
-  8766+), the browser GUI (single big HTML string), and all `/api/*` endpoints.
+- `app.py` — stdlib `ThreadingHTTPServer` on loopback (prefers port 8765, then
+  8766–8774, then an OS-assigned port), the standalone Edge/Chrome app-window GUI by default
+  (optional embedded Qt WebEngine)
+  (single big HTML string), and all `/api/*` endpoints.
   Live transcription jobs (threaded), model auto-selection (writer/general/typed
   with page-height auto-detect for screenshots), Word export (plain + layout-
   preserving + bold runs), the quarantine UI, training dashboard, fixes tab,
   writer add/delete, deep page-correction, upload-to-dev.
 - `paths.py` — separates code from data. Frozen EXE → data in
-  `%LOCALAPPDATA%\KtavYadAI` with first-run seeding. `SYNTH_CORPUS` = the lite
+  the executable directory with first-run seeding; user data lives in adjacent
+  `data` and `models` folders so the distribution is portable. `SYNTH_CORPUS` = the lite
   corpus if present (the full 320MB corpus is **not** shipped; the LM works from
   caches).
 - `main.py` — EXE entry point; dispatches `--train` for the frozen detached
   trainer.
-- `build_exe.bat` / `KtavYadAI.spec` — PyInstaller onedir build. Ships
+- `build_exe.bat` / `KtavYadAI.spec` — PyInstaller one-file build. Bundles the
+  Python runtime and required packages, with Qt WebEngine only for the optional
+  embedded build. Runtime DLLs are explicitly sourced from Windows System32 to
+  avoid stale copies discovered on PATH. Ships
   base+general+typed models, `corpus_lite.txt`, the three `.lm_*.pkl` caches,
-  `fixes_general.tsv`, `config.json`. **No writer data, no personal model, no
-  history/quarantine** — users start with an empty personal profile.
+  `fixes_general.tsv`, `config.json`. On first run it seeds writable `data/`
+  and `models/` folders beside the EXE, where user training is retained.
+  **No writer data, no personal model, no history/quarantine** — users start
+  with an empty personal profile.
 - `build_corpus.py` / `expand_corpus.py` — corpus builders from Wikisource +
   the Otzaria library (github.com/Sivan22/otzaria-library). `make_corpus_lite.py`
   — strided 156K-line sample for shipping.
@@ -210,13 +219,14 @@ frames, use 1−p2/p1); (4) self-training on unlabeled pages behind the gates;
 ## 9. How to run / test / build
 
 ```bash
-# environment: Python 3.14 venv with torch(CPU), numpy, pillow, pypdfium2,
-# certifi, truststore, pyinstaller
-venv\Scripts\python.exe app.py            # launch GUI on http://127.0.0.1:8765
+# runtime/build dependencies are listed in requirements.txt; pywebview[qt] is optional
+python -m venv venv                       # Python 3.13 or 3.14; only needed once
+venv\Scripts\python.exe -m pip install -r requirements.txt
+venv\Scripts\python.exe app.py            # system browser; install pywebview[qt] for embedded mode
 venv\Scripts\python.exe train.py chain <writer>     # personal then general
 venv\Scripts\python.exe measure_suggest.py 8 21 33  # postfix gate (run before any postfix edit)
 venv\Scripts\python.exe test_v3.py && ... test_final.py && ... test_user_sim.py 15
-# build EXE (bat fails from Git Bash; run the direct pyinstaller command from PowerShell)
+# build_exe.bat selects browser mode and runs --diagnose-startup, logging to data/startup.log
 ```
 
 ## 10. Known pitfalls (hard-won)

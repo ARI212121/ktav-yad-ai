@@ -109,10 +109,38 @@ class MixedSampler:
         self.text_sampler = synth.TextSampler(SYNTH_CORPUS)
         self.real_items = real_items or []
         self.real_ratio = real_ratio if self.real_items else 0.0
+        self._real_order = []
+        self._real_pos = 0
+
+    def _next_real(self):
+        if self._real_pos >= len(self._real_order):
+            self._real_order = list(range(len(self.real_items)))
+            self.rng.shuffle(self._real_order)
+            self._real_pos = 0
+        index = self._real_order[self._real_pos]
+        self._real_pos += 1
+        return self.real_items[index]
+
+    def state_dict(self):
+        return {
+            "rng": self.rng.getstate(),
+            "real_order": self._real_order,
+            "real_pos": self._real_pos,
+        }
+
+    def load_state_dict(self, state):
+        self.rng.setstate(state["rng"])
+        order = state.get("real_order", [])
+        if (not isinstance(order, list)
+                or any(not isinstance(index, int) or index < 0
+                       or index >= len(self.real_items) for index in order)):
+            raise ValueError("checkpoint contains an invalid real-sample order")
+        self._real_order = order
+        self._real_pos = min(max(0, int(state.get("real_pos", 0))), len(order))
 
     def sample_one(self):
         if self.real_items and self.rng.random() < self.real_ratio:
-            path, text = self.rng.choice(self.real_items)
+            path, text = self._next_real()
             try:
                 arr = light_augment(load_line_image(path), self.rng)
                 return arr, text

@@ -17,6 +17,7 @@ import time
 import random
 import shutil
 import argparse
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -30,6 +31,7 @@ from paths import MODELS_DIR as MODELS
 os.makedirs(MODELS, exist_ok=True)
 BASE_CKPT = os.path.join(MODELS, "base_synth.pt")
 HISTORY_DIR = os.path.join(MODELS, "history")
+STOP_FILE = os.path.join(MODELS, "train.stop")
 
 # אותו קוד משרת את שני מסלולי החומרה שבתרשים: עם GPU (מסלול A) אימון מואץ,
 # בלעדיו (מסלול B) הכול על המעבד — אין שתי מערכות נפרדות.
@@ -238,6 +240,14 @@ def train(target, steps, batch_size, lr, resume=False):
             print("אזהרה: אין מודל בסיס (models/base_synth.pt) — מאמן מאפס. מומלץ קודם: python train.py base")
             start_from = None
 
+    resume_path = ckpt_path + ".last"
+    if not resume and os.path.isfile(resume_path):
+        archived_resume = resume_path + ".previous"
+        os.replace(resume_path, archived_resume)
+    resume_latest = bool(resume and os.path.isfile(resume_path))
+    if resume_latest:
+        start_from = resume_path
+    ckpt = {}
     if start_from:
         model, ckpt = load_checkpoint(start_from, NUM_CLASSES, CHARSET)
         print(f"נטען צ'קפוינט: {start_from} (צעד {ckpt.get('step', '?')})")
@@ -249,6 +259,26 @@ def train(target, steps, batch_size, lr, resume=False):
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps, eta_min=lr * 0.1)
+    training_state = ckpt.get("training_state", {}) if resume_latest else {}
+    if ckpt.get("charset_upgraded_from"):
+        training_state = {}
+    start_step = int(ckpt.get("step", 0)) if resume_latest and training_state else 0
+    target_steps = int(training_state.get("target_steps", steps))
+    if training_state:
+        opt.load_state_dict(training_state["optimizer"])
+        sched.load_state_dict(training_state["scheduler"])
+        random.setstate(training_state["python_rng"])
+        np.random.set_state(training_state["numpy_rng"])
+        torch.set_rng_state(training_state["torch_rng"])
+        if torch.cuda.is_available() and training_state.get("cuda_rng"):
+            torch.cuda.set_rng_state_all(training_state["cuda_rng"])
+        sampler_state = training_state.get("sampler_state")
+        if sampler_state is not None and hasattr(sampler, "load_state_dict"):
+            sampler.load_state_dict(sampler_state)
+        else:
+            sampler_rng = training_state.get("sampler_rng")
+            if sampler_rng is not None and hasattr(sampler, "rng"):
+                sampler.rng.setstate(sampler_rng)
     ctc = nn.CTCLoss(blank=0, zero_infinity=True)
 
     t0 = time.time()
@@ -264,6 +294,39 @@ def train(target, steps, batch_size, lr, resume=False):
         log_f.write(line + "\n")
         log_f.flush()
 
+    def save_resume_checkpoint(step):
+        state = {
+            "optimizer": opt.state_dict(),
+            "scheduler": sched.state_dict(),
+            "target_steps": target_steps,
+            "python_rng": random.getstate(),
+            "numpy_rng": np.random.get_state(),
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            "sampler_rng": sampler.rng.getstate() if hasattr(sampler, "rng") else None,
+            "sampler_state": (sampler.state_dict()
+                              if hasattr(sampler, "state_dict") else None),
+        }
+        save_checkpoint(resume_path, model, CHARSET, step,
+                        {"target_steps": target_steps}, state)
+
+    def save_if_improved(step, score):
+        nonlocal best_cer, improved, backed_up
+        if step <= 0 and baseline is None:
+            return False
+        if score > best_cer:
+            return False
+        best_cer = score
+        if not backed_up and os.path.exists(ckpt_path):
+            _backup_to_history(ckpt_path, log_name)
+            backed_up = True
+        save_checkpoint(ckpt_path, model, CHARSET, step, {"val_cer": score})
+        improved = True
+        log(f"  -> נשמר מודל משופר: {ckpt_path}")
+        return True
+
+    if training_state:
+        log(f"Resume from step {start_step}/{target_steps}; data reloaded")
     log(f"מתחיל אימון: יעד={target}, צעדים={steps}, אצווה={batch_size}, lr={lr}"
         + (f" | GPU: {torch.cuda.get_device_name(0)}" if DEVICE.type == "cuda" else ""))
 
@@ -272,12 +335,31 @@ def train(target, steps, batch_size, lr, resume=False):
     # (rollback אוטומטי), ואי אפשר "לקלקל" מודל עובד בריצת אימון גרועה.
     baseline = None
     if start_from:
-        baseline = evaluate(model, val_batch)
+        if resume_latest and os.path.isfile(ckpt_path):
+            baseline_model, _ = load_checkpoint(ckpt_path, NUM_CLASSES, CHARSET)
+            baseline_model.to(DEVICE)
+            baseline = evaluate(baseline_model, val_batch)
+            del baseline_model
+        else:
+            baseline = evaluate(model, val_batch)
         log(f"CER בסיס לפני אימון: {baseline*100:.2f}% (שער רגרסיה פעיל)")
     best_cer = baseline if baseline is not None else float("inf")
     improved, backed_up = False, False
 
-    for step in range(1, steps + 1):
+    if start_step >= target_steps:
+        log(f"No steps remain; checkpoint already reached {target_steps}")
+        log_f.close()
+        return True
+
+    for step in range(start_step + 1, target_steps + 1):
+        if os.path.exists(STOP_FILE):
+            save_resume_checkpoint(step - 1)
+            score = evaluate(model, val_batch)
+            log(f"עצירה: CER באימות באותה חלוקה קבועה: {score*100:.2f}%")
+            save_if_improved(step - 1, score)
+            log(f"Training stopped by request; resume is available at step {step - 1}")
+            log_f.close()
+            return False
         imgs, targets, in_lens, tgt_lens, _ = sampler.batch(batch_size)
         logits = model(imgs.to(DEVICE))           # B,T,C
         log_probs = logits.log_softmax(-1).permute(1, 0, 2)  # T,B,C
@@ -293,22 +375,17 @@ def train(target, steps, batch_size, lr, resume=False):
 
         if step % 50 == 0:
             rate = step / (time.time() - t0)
-            log(f"צעד {step}/{steps} | loss={loss_acc/n_acc:.4f} | {rate:.2f} צעדים/שנ'")
+            log(f"צעד {step}/{target_steps} | loss={loss_acc/n_acc:.4f} | {rate:.2f} צעדים/שנ'")
             loss_acc, n_acc = 0.0, 0
 
         eval_every = 500 if is_base else (200 if is_general else 100)
-        if step % eval_every == 0 or step == steps:
+        if step % 50 == 0:
+            save_resume_checkpoint(step)
+        if step % eval_every == 0 or step == target_steps:
             v = evaluate(model, val_batch)
             log(f"  -> CER באימות: {v*100:.2f}%")
-            save_checkpoint(ckpt_path + ".last", model, CHARSET, step)
-            if v <= best_cer:
-                best_cer = v
-                if not backed_up and os.path.exists(ckpt_path):
-                    _backup_to_history(ckpt_path, log_name)   # גרסה קודמת לארכיון
-                    backed_up = True
-                save_checkpoint(ckpt_path, model, CHARSET, step, {"val_cer": v})
-                improved = True
-                log(f"  -> נשמר מודל משופר: {ckpt_path}")
+            save_resume_checkpoint(step)
+            save_if_improved(step, v)
 
     if improved:
         log(f"האימון הסתיים. CER הטוב ביותר: {best_cer*100:.2f}%")
@@ -322,7 +399,7 @@ def train(target, steps, batch_size, lr, resume=False):
                   encoding="utf-8") as mf:
             json.dump({"target": log_name,
                        "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
-                       "steps": steps,
+                       "steps": target_steps,
                        "train_samples": len(sampler.real_items) or None,
                        "baseline_cer": baseline,
                        "best_cer": None if best_cer == float("inf") else best_cer,
@@ -331,12 +408,14 @@ def train(target, steps, batch_size, lr, resume=False):
     except OSError:
         pass
     log_f.close()
+    return True
 
 
 PID_FILE = os.path.join(MODELS, "train.pid")
 
 
 def _write_pid():
+    _clear_stop_request()
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -348,21 +427,30 @@ def _clear_pid():
         pass
 
 
-def chain(writer_name, steps_writer=2000, steps_general=2000):
+def _clear_stop_request():
+    try:
+        os.remove(STOP_FILE)
+    except OSError:
+        pass
+
+
+def chain(writer_name, steps_writer=2000, steps_general=2000, resume=True):
     """שרשרת האימון המלאה: קודם המודל האישי של הכותב, ואז המודל הכללי
     (שמתאמן על כל הכותבים יחד). כך כל אימון משפר את שניהם."""
     _write_pid()
     try:
         try:
-            train(writer_name, steps_writer, 24, 1e-4, resume=True)
+            completed = train(writer_name, steps_writer, 24, 1e-4, resume=resume)
         except SystemExit:
-            pass
-        try:
-            train("__general__", steps_general, 24, 1e-4, resume=True)
-        except SystemExit:
-            pass
+            completed = not os.path.exists(STOP_FILE)
+        if completed and not os.path.exists(STOP_FILE):
+            try:
+                train("__general__", steps_general, 24, 1e-4, resume=resume)
+            except SystemExit:
+                pass
     finally:
         _clear_pid()
+        _clear_stop_request()
 
 
 if __name__ == "__main__":
@@ -374,6 +462,8 @@ if __name__ == "__main__":
     ap.add_argument("--batch", type=int, default=24)
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--fresh", action="store_true",
+                    help="start a fresh run and archive the interrupted checkpoint")
     args = ap.parse_args()
 
     if args.mode == "rollback":
@@ -386,7 +476,7 @@ if __name__ == "__main__":
         if not args.name:
             print("צריך שם כותב: python train.py chain <שם>")
             sys.exit(1)
-        chain(args.name, args.steps or 2000, args.steps or 2000)
+        chain(args.name, args.steps or 2000, args.steps or 2000, resume=args.resume and not args.fresh)
         sys.exit(0)
 
     _write_pid()
@@ -404,3 +494,4 @@ if __name__ == "__main__":
             train("base", args.steps or 30000, args.batch, args.lr or 3e-4, args.resume)
     finally:
         _clear_pid()
+        _clear_stop_request()

@@ -6,7 +6,7 @@ DIGITS = "0123456789"
 LATIN = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 PUNCT = " .,:;!?\"'()-/%+=*#@&_₪״׳"
 # תווים שנוספו מאוחר יותר — חובה להוסיף רק בסוף כדי לא לשבור מודלים קיימים
-EXTRA = "[]–"
+EXTRA = "[]\u2013\\|<>{}~^$\u20ac\u00a3\u00a5\u00a9\u00ae\u00b0\u2026"
 CHARSET = HEBREW + DIGITS + LATIN + PUNCT + EXTRA
 
 BLANK = 0  # CTC blank
@@ -47,8 +47,12 @@ def decode_ctc(indices):
 # וממירים חזרה לסדר לוגי בפלט.
 
 _LTR = set(DIGITS + LATIN)
-_WEAK = set(".,:/-%'\"")
-_MIRROR = {"(": ")", ")": "(", "[": "]", "]": "["}
+_WEAK = set(".,:/-%_\\|<>~^$" + chr(8364) + chr(163) + chr(165)
+            + chr(39) + chr(34))
+_MIRROR = {
+    "(": ")", ")": "(", "[": "]", "]": "[",
+    "{": "}", "}": "{", "<": ">", ">": "<",
+}
 
 
 def _fix_runs(s):

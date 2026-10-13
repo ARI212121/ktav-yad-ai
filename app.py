@@ -17,12 +17,14 @@ import re
 import json
 import base64
 import ctypes
+import importlib
+import logging
+import shutil
 import zipfile
 import threading
 import subprocess
 import sys
 import time
-import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 from xml.sax.saxutils import escape as xml_escape
@@ -30,23 +32,29 @@ from xml.sax.saxutils import escape as xml_escape
 import torch
 from PIL import Image
 
-from paths import MODELS_DIR as MODELS, UPLOADS_DIR, FROZEN
+from paths import BUNDLE, DATA_DIR, MODELS_DIR as MODELS, UPLOADS_DIR, FROZEN
 from charset import CHARSET, NUM_CLASSES, clean, decode_ctc, to_logical
 from model import load_checkpoint
 from segment import (segment_page, segment_page_ex, WRITERS_DIR, TEMPLATES_DIR,
                      ingest_template)
 from infer import (pil_to_array, transcribe_with_conf, transcribe_rescued,
                    bold_word_indices)
+import ai_correction
 import postfix
 import gates
 import fixes
+import records
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+VERSION = "1.0.1"
+WINDOW_SIZE_PATH = os.path.join(DATA_DIR, "window_size.json")
+DEFAULT_WINDOW_SIZE = (1220, 880)
 PORT = 8765
 PID_FILE = os.path.join(MODELS, "train.pid")
+TRAIN_STOP_FILE = os.path.join(MODELS, "train.stop")
 
 _state = {"models": {}}
 _jobs = {}
@@ -188,6 +196,16 @@ def save_lines(writer, lines):
 
 # ---------------------------------------------------------------- אימון
 def _pid_alive(pid):
+    if os.name != "nt":
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
     SYNCHRONIZE = 0x00100000
     h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
     if not h:
@@ -214,15 +232,18 @@ def _train_pid():
 
 def training_running():
     pid = _train_pid()
-    if pid is not None and _pid_alive(pid):
+    if pid is None:
+        return False
+    if _pid_alive(pid):
         return True
-    # גיבוי: יומן אימון שעודכן בשש הדקות האחרונות = אימון פעיל (גם חיצוני;
-    # רישום ליומן קורה כל ~50 צעדים, שיכולים לקחת כמה דקות במעבד עמוס)
-    _, m = _latest_log()
-    return bool(m) and (time.time() - m) < 360
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+    return False
 
 
-def start_training(writer, scope="both"):
+def start_training(writer, scope="both", resume=True):
     """מפעיל אימון עצמאי לפי היקף: both (אישי+כללי) / personal / general.
     התהליך מנותק מהתוכנה וממשיך גם אם סוגרים אותה."""
     if training_running():
@@ -232,22 +253,33 @@ def start_training(writer, scope="both"):
             "general": ["train_general.log"]}.get(scope, [])
     for f in logs:
         open(os.path.join(MODELS, f), "w", encoding="utf-8").close()
-    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    try:
+        os.remove(TRAIN_STOP_FILE)
+    except OSError:
+        pass
+    flags = (subprocess.DETACHED_PROCESS |
+             subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
+    run_mode = "--resume" if resume else "--fresh"
     if FROZEN:
-        cmd = [sys.executable, "--train", writer or "-"]
+        cmd = [sys.executable, "--train", writer or "-", run_mode]
         if scope == "personal":
             cmd.append("--personal-only")
         elif scope == "general":
             cmd.append("--general-only")
     else:
         if scope == "general":
-            cmd = [sys.executable, os.path.join(HERE, "train.py"), "general", "--resume"]
+            cmd = [sys.executable, os.path.join(HERE, "train.py"), "general", run_mode]
         elif scope == "personal":
-            cmd = [sys.executable, os.path.join(HERE, "train.py"), "writer", writer, "--resume"]
+            cmd = [sys.executable, os.path.join(HERE, "train.py"), "writer", writer, run_mode]
         else:
-            cmd = [sys.executable, os.path.join(HERE, "train.py"), "chain", writer]
-    subprocess.Popen(cmd, cwd=HERE, creationflags=flags, close_fds=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cmd = [sys.executable, os.path.join(HERE, "train.py"), "chain", writer, run_mode]
+    process_kwargs = {"creationflags": flags} if os.name == "nt" else {
+        "start_new_session": True}
+    process = subprocess.Popen(
+        cmd, cwd=HERE, close_fds=True, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, **process_kwargs)
+    with open(PID_FILE, "w", encoding="ascii") as f:
+        f.write(str(process.pid))
     what = {"both": "אישי + כללי", "personal": "אישי בלבד",
             "general": "הכללי בלבד"}.get(scope, scope)
     return True, f"האימון החל ({what}). רץ ברקע — אפשר לסגור את התוכנה."
@@ -358,7 +390,7 @@ def delete_writer(writer):
     shutil.rmtree(wdir, ignore_errors=True)
     removed = ["נתוני האימון"]
     model_f = os.path.join(MODELS, f"writer_{writer}.pt")
-    for f in (model_f, model_f + ".last",
+    for f in (model_f, model_f + ".last", model_f + ".last.previous",
               os.path.join(MODELS, f"{writer}.meta.json"),
               os.path.join(MODELS, f"train_{writer}.log")):
         try:
@@ -382,15 +414,11 @@ def delete_writer(writer):
 
 def stop_training():
     pid = _train_pid()
-    if pid and _pid_alive(pid):
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True)
-        try:
-            os.remove(PID_FILE)
-        except OSError:
-            pass
-        return True
-    return False
+    if not pid or not _pid_alive(pid):
+        return False
+    with open(TRAIN_STOP_FILE, "w", encoding="ascii") as f:
+        f.write("stop")
+    return True
 
 
 def _latest_log():
@@ -469,7 +497,13 @@ def _run_transcribe_job(job_id, files, page_mode, writer, prefer, use_fix):
             if page_mode:
                 tmp = os.path.join(UPLOADS_DIR, f"_job{job_id}.png")
                 pil.save(tmp)
-                items = segment_page_ex(tmp)
+                try:
+                    items = segment_page_ex(tmp)
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except FileNotFoundError:
+                        pass
             else:
                 items = [(pil, None)]
             imgs = [im for im, _ in items]
@@ -484,7 +518,10 @@ def _run_transcribe_job(job_id, files, page_mode, writer, prefer, use_fix):
                 tm, tk = get_model(None, "typed")
                 if tk == "__typed__":
                     page_model, page_key = tm, tk
-            job["model"] = page_key
+            with _jobs_lock:
+                job["model"] = page_key
+                if page_key not in job["models_used"]:
+                    job["models_used"].append(page_key)
             for k, (im, geom) in enumerate(items):
                 path_info = {} if geom and geom.get("em_spans") else None
                 rescued = transcribe_rescued(page_model, im, med_h,
@@ -520,7 +557,9 @@ def _run_transcribe_job(job_id, files, page_mode, writer, prefer, use_fix):
                     is_note = len(items) > 3 and im2.height < med_h * 0.62
                     with _jobs_lock:
                         job["lines"].append({"img": img_to_b64(im2), "text": text,
-                                             "src": label, "conf": round(conf, 3),
+                                             "src": label, "page": p_idx,
+                                             "ai_crop": page_mode,
+                                             "conf": round(conf, 3),
                                              "note": is_note, "geom": geom,
                                              "sugg": sugg, "bold": bold,
                                              "typed": is_typed_page})
@@ -558,7 +597,8 @@ def _run_transcribe_job(job_id, files, page_mode, writer, prefer, use_fix):
 def start_transcribe(files, page_mode, writer, prefer, use_fix=True):
     job_id = str(int(time.time() * 1000))
     _jobs[job_id] = {"pages_total": 0, "pages_done": 0, "cur": "", "lines": [],
-                     "done": False, "error": None, "model": None, "progress": 0.0}
+                     "done": False, "error": None, "model": None,
+                     "models_used": [], "progress": 0.0}
     threading.Thread(target=_run_transcribe_job,
                      args=(job_id, files, page_mode, writer, prefer, use_fix),
                      daemon=True).start()
@@ -890,7 +930,8 @@ def list_templates():
 # ---------------------------------------------------------------- HTML
 HTML = r"""<!DOCTYPE html>
 <html dir="rtl" lang="he"><head><meta charset="utf-8">
-<title>כתב-יד AI — תמלול אישי</title>
+<link rel="icon" href="/favicon.ico">
+<title>כתב-יד AI 1.0.1 — תמלול אישי</title>
 <style>
  :root{--navy:#141e3c;--blue:#1d4e89;--teal:#0e7c7b;--green:#17805a;--bg:#eef1f6;--card:#fff;--line:#e3e7ef}
  *{box-sizing:border-box}
@@ -923,6 +964,8 @@ HTML = r"""<!DOCTYPE html>
  .line img{max-width:40%;max-height:42px;border:1px solid var(--line);border-radius:3px;background:#fff;object-fit:contain;margin-top:2px;cursor:zoom-in}
  .line img.zoom{max-width:75%;max-height:140px;cursor:zoom-out}
  .line .num{min-width:20px;text-align:center;color:#98a1b5;font-size:10.5px;margin-top:6px}
+ .line .aiRowSelect{display:none;margin-top:7px;flex:0 0 auto}
+ body.aiManualSelection .line .aiRowSelect{display:inline-block}
  .line textarea.lt{flex:1;font-size:14.5px;line-height:1.4;direction:rtl;border:0;background:transparent;
   padding:3px 6px;border-bottom:1px solid transparent;resize:none;overflow:hidden;min-height:24px;font-family:inherit}
  .line textarea.lt:focus{outline:none;border-bottom:2px solid var(--teal)}
@@ -945,6 +988,15 @@ HTML = r"""<!DOCTYPE html>
  .mini:hover{background:#d6dcea}
  .mini.sugg{background:#fdf3d0;font-size:14px}
  .mini.sugg:hover{background:#f8e6a0}
+ #appDialog{position:fixed;inset:0;z-index:10000;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(12,20,39,.52)}
+ #appDialog.open{display:flex}
+ #appDialogPanel{width:min(540px,100%);max-height:min(80vh,680px);overflow:auto;background:#fff;border:1px solid #dbe1ec;border-radius:16px;box-shadow:0 18px 60px rgba(10,20,40,.28);padding:24px}
+ #appDialogTitle{margin:0 0 12px;color:var(--navy);font-size:19px}
+ #appDialogMessage{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6;color:#344058}
+ #appDialogInput{display:none;width:100%;margin-top:16px}
+ #appDialogActions{display:flex;gap:10px;justify-content:flex-start;margin-top:22px}
+ #appDialogActions button{min-width:92px}
+ @media(max-width:600px){#appDialogPanel{padding:18px}#appDialogActions button{flex:1}}
  @media(max-width:820px){.grid2{grid-template-columns:1fr}.line img{max-width:230px}}
 </style></head><body>
 <header>
@@ -956,7 +1008,8 @@ HTML = r"""<!DOCTYPE html>
   <option value="general">המודל הכללי</option>
   <option value="typed">טקסט מוקלד / צילום מסך</option>
  </select>
- <span id="writerInfo" class="pill gray"></span>
+  <span id="modelUsed" class="pill gray" title="המודל או המודלים שנבחרו בפועל לעבודה האחרונה"></span>
+  <span id="writerInfo" class="pill gray"></span>
 </header>
 <nav>
  <button class="active" onclick="showTab('tabScan',this)">📄 תמלול</button>
@@ -980,7 +1033,6 @@ HTML = r"""<!DOCTYPE html>
    <label><input type="checkbox" id="pageMode" checked> עמודים מלאים (פילוח אוטומטי לשורות)</label>
    <label><input type="checkbox" id="fixMode" checked> תיקון מילוני אוטומטי</label>
    <button class="btn" onclick="transcribe()" id="btnGo">🚀 תמלל הכול</button>
-   <span id="modelUsed" class="muted"></span>
   </div>
  </div>
  <div class="card" id="scanProg" style="display:none">
@@ -992,6 +1044,15 @@ HTML = r"""<!DOCTYPE html>
   <b class="title">תוצאות</b> <span class="muted">— עריכה רציפה: אנטר/חצים עוברים בין השורות · ✖ מוחק שורת סרק · ⤴ ממזג לשורה הקודמת</span>
   <div id="magBar"><img id="magImg" alt=""></div>
   <div id="lines"></div>
+  <div id="aiReview" class="card" style="display:none;margin-top:12px">
+   <b class="title">הצעות תיקון מ-Google AI Studio — טיוטה לבדיקה</b>
+   <p class="muted">התמונות והטקסט שזוהה נשלחו ל-Google רק בעקבות לחיצה על „הצע תיקון AI”.
+    ההצעות אינן נשמרות או מאומנות אוטומטית. בדוק כל שינוי, החל רק את המתאימים,
+    ערוך לפי הצורך, ורק אז שמור לאימון.</p>
+    <button class="btn green" onclick="applyAllAICorrections()">החל את כל ההצעות לטיוטה</button>
+    <div id="aiReviewList"></div>
+   <span id="aiReviewMsg" class="muted"></span>
+  </div>
   <div class="exportBar">
    <b>ייצוא:</b>
    <label><input type="radio" name="expMode" value="orig" checked> שורות כמו במקור</label>
@@ -999,6 +1060,65 @@ HTML = r"""<!DOCTYPE html>
    <label><input type="radio" name="expMode" value="dots"> ירידת שורה רק אחרי נקודה</label>
    <button class="btn" style="background:#6a3fa0" onclick="deepSuggest()"
     title="ניתוח כל המסמך במקביל: אוצר המילים של כל העמודים + רצף ההקשר חוצה-השורות">🧠 תיקון מורחב (ניתוח כל המסמך)</button>
+   <label>היקף AI:
+    <select id="aiScope" onchange="updateAISelectionControls()">
+     <option value="lines">שורות ראשונות</option>
+     <option value="pages">עמודים ראשונים (כל חיתוכי השורות)</option>
+     <option value="manual">בחירה ידנית של שורות</option>
+    </select>
+   </label>
+   <label id="aiAmountControl">כמות:
+    <input id="aiAmount" type="number" value="8" min="1" step="1"
+     style="width:76px" onchange="updateAISelectionControls()">
+   </label>
+   <span id="aiManualControls" style="display:none">
+    <button class="mini" type="button" onclick="setAISelection(true)">בחר הכול</button>
+    <button class="mini" type="button" onclick="invertAISelection()">הפוך בחירה</button>
+    <button class="mini" type="button" onclick="setAISelection(false)">נקה בחירה</button>
+   </span>
+   <label>מספרי שורות:
+    <input id="aiLineNumbers" type="text" placeholder="למשל 1,3-5"
+     style="width:110px">
+   </label>
+   <button class="mini" type="button" onclick="selectAILinesByNumber()">סמן לפי מספרים</button>
+   <label>מפתח API:
+    <select id="aiKeyChoice" title="בחר מפתח שמור או השתמש בסבב האוטומטי">
+     <option value="">בחירה אוטומטית</option>
+    </select>
+   </label>
+   <label title="מספר חיתוכי השורות בכל בקשת רשת; יותר שורות בבקשה מפחית בקשות נפרדות">
+    שורות לבקשה:
+    <input id="aiBatchSize" type="number" min="1" max="16" value="8"
+     style="width:70px" onchange="saveAISettings()">
+   </label>
+   <details style="display:inline-block">
+    <summary style="cursor:pointer">פרמטרים מתקדמים</summary>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px">
+     <label>Temperature
+      <input id="aiTemperature" type="number" min="0" max="2" step="0.1"
+       value="0" style="width:72px" onchange="saveAISettings()">
+     </label>
+     <label>Top-P
+      <input id="aiTopP" type="number" min="0" max="1" step="0.01"
+       style="width:72px" onchange="saveAISettings()">
+     </label>
+     <label>Top-K
+      <input id="aiTopK" type="number" min="1" max="1000" step="1"
+       style="width:72px" onchange="saveAISettings()">
+     </label>
+     <label>טוקנים מרביים
+      <input id="aiMaxOutputTokens" type="number" min="1" max="65536" step="1"
+       style="width:92px" onchange="saveAISettings()">
+     </label>
+     <label>פסק זמן (שניות)
+      <input id="aiRequestTimeout" type="number" min="1" max="300" step="1"
+       value="90" style="width:76px" onchange="saveAISettings()">
+     </label>
+     <button class="mini" type="button" onclick="resetAISettings()">אפס לברירות מחדל</button>
+    </div>
+   </details>
+   <button class="btn" style="background:#7352a3" id="aiCorrectBtn" onclick="aiCorrect()">✨ הצע תיקון AI</button>
+   <span id="aiSelectionInfo" class="muted"></span>
    <button class="btn" style="background:#b8860b" onclick="applyAllSuggs()">💡 החל את כל ההצעות</button>
    <button class="btn" onclick="copyText()">📋 העתק</button>
    <button class="btn" onclick="downloadTxt()">⬇️ TXT</button>
@@ -1017,6 +1137,30 @@ HTML = r"""<!DOCTYPE html>
 </div>
 
 <div id="tabTrain" style="display:none">
+ <div class="card">
+  <b class="title">✨ תיקון תמלול בעזרת Google AI Studio</b>
+  <p class="muted">הוסף מפתחות API מ-Google AI Studio; לכל מפתח אפשר לתת שם.
+   אם מפתח מגיע למכסה שלו, התוכנה תנסה מפתח אחר שהוספת.
+   המפתחות נשמרים מוצפנים לחשבון Windows הנוכחי ואינם נכללים בחבילות האימון.
+   אפשר לבחור מספר שורות או עמודים; חיתוכי השורות נשלחים בבקשות קטנות ברצף.</p>
+  <p class="muted">מפתחות ששייכים לאותו פרויקט חולקים את אותה מכסה; הוספת מפתחות
+   מאותו פרויקט אינה מגדילה אותה. בזמן תיקון, שגיאת מכסה או הרשאה תעביר למפתח הבא;
+   שגיאת חיבור תוצג ולא תגרום לניסיונות מיותרים עם כל המפתחות.</p>
+  <p class="muted"><a href="https://aistudio.google.com/rate-limit?timeRange=last-28-days"
+   target="_blank" rel="noreferrer">צפה במכסות ובשימוש הפעיל ב-Google AI Studio</a>
+   — יתרת המכסה אינה זמינה בתשובת ה-API.</p>
+  <p class="muted"><b>פרטיות:</b> תמונות השורות והטקסט שזוהה נשלחים ל-Google רק כשלוחצים
+   על „✨ הצע תיקון AI”. אין שליחה אוטומטית בזמן תמלול, שמירה או אימון.</p>
+  <div>
+   <input type="text" id="aiKeyName" maxlength="60" placeholder="שם למפתח, למשל אישי">
+   <input type="password" id="aiKeyValue" autocomplete="new-password" placeholder="מפתח API של Google AI Studio">
+   <button class="btn" onclick="addAIKey()">➕ שמור מפתח</button>
+   <span id="aiKeyMsg" class="muted"></span>
+  </div>
+  <button class="btn" id="aiKeysCheckAll" onclick="checkAllAIKeys()">🔄 בדוק/רענן חיבור לכל המפתחות</button>
+  <span class="muted">בדיקת החיבור אינה שולחת תמונות ואינה בודקת מכסת יצירה; היא מאמתת גישה למודל.</span>
+  <div id="aiKeyList" class="muted" style="margin-top:10px"></div>
+ </div>
  <div class="grid2">
   <div class="card"><b class="title">מצב האימון</b>
    <div id="trainIdle" class="muted" style="margin-top:8px">אין אימון פעיל.</div>
@@ -1033,7 +1177,8 @@ HTML = r"""<!DOCTYPE html>
      <option value="personal">רק המודל האישי</option>
      <option value="general">רק המודל הכללי (הזרמת הנתונים הקיימים אליו)</option>
     </select>
-    <button class="btn green" onclick="train()">🎓 אמן עכשיו</button>
+    <button class="btn green" onclick="train(undefined,true)">&#1492;&#1502;&#1513;&#1498; &#1488;&#1497;&#1502;&#1493;&#1503; / &#1488;&#1502;&#1503; &#1495;&#1491;&#1513;</button>
+    <button class="btn" onclick="train(undefined,false)" title="Start over from the base/general model; the interrupted checkpoint is kept as a backup">&#1488;&#1514;&#1495;&#1500; &#1488;&#1497;&#1502;&#1493;&#1503; &#1502;&#1495;&#1491;&#1513;</button>
     <button class="btn red" onclick="stopTrain()">⏹ עצור אימון</button>
    </div>
    <div class="muted" style="margin-top:8px">מומלץ אימון מלא: המודל הכללי לומד מכל הכותבים יחד,
@@ -1055,6 +1200,20 @@ HTML = r"""<!DOCTYPE html>
    <button class="btn red" style="margin-right:18px" onclick="deleteWriter()"
     title="מוחק את הכותב הנבחר למעלה: נתוני האימון + המודל האישי. בלתי הפיך!">🗑 מחק את הכותב הנבחר</button>
    <span id="delWriterMsg" class="muted"></span>
+  </div>
+ </div>
+ <div class="card">
+  <b class="title">🗂️ היסטוריית דוגמאות האימון — צפייה, עריכה ומחיקה</b>
+  <p class="muted">כאן אפשר לתקן תיוג שנשמר לא נכון או להסיר דוגמה. השינוי מתעדכן
+   בקובצי האימון ובאינדקס הכפילויות; הוא לא מוחק ידע שכבר נכנס למשקולות המודל.
+   לאחר תיקון נתונים, הפעל אימון מחדש או שחזר גרסת מודל קודמת.</p>
+  <div><button class="btn" onclick="refreshExamples()">רענן דוגמאות</button>
+   <span id="examplesSummary" class="muted"></span></div>
+  <div id="examplesList"></div>
+  <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
+   <button class="btn" id="examplesPrev" onclick="pageExamples(-1)">הקודם</button>
+   <span id="examplesPage" class="muted"></span>
+   <button class="btn" id="examplesNext" onclick="pageExamples(1)">הבא</button>
   </div>
  </div>
  <div class="card" id="quarCard" style="display:none"><b class="title">🛃 הסגר — שורות שממתינות לאישור</b>
@@ -1175,7 +1334,56 @@ HTML = r"""<!DOCTYPE html>
 </div>
 
 </main>
+<div id="appDialog" role="presentation">
+ <section id="appDialogPanel" role="dialog" aria-modal="true" aria-labelledby="appDialogTitle"
+  aria-describedby="appDialogMessage">
+  <h2 id="appDialogTitle">כתב-יד AI</h2>
+  <p id="appDialogMessage"></p>
+  <input id="appDialogInput" type="text">
+  <div id="appDialogActions">
+   <button id="appDialogCancel" class="btn teal" type="button">ביטול</button>
+   <button id="appDialogAccept" class="btn" type="button">אישור</button>
+  </div>
+ </section>
+</div>
 <script>
+let appDialogQueue=Promise.resolve();
+function showAppDialog(message,{title='כתב-יד AI',confirm=false,input=null,initialValue=''}={}){
+ const openDialog=()=>new Promise(resolve=>{
+  const overlay=document.getElementById('appDialog'),inputEl=document.getElementById('appDialogInput');
+  const cancel=document.getElementById('appDialogCancel'),accept=document.getElementById('appDialogAccept');
+  document.getElementById('appDialogTitle').textContent=title;
+  document.getElementById('appDialogMessage').textContent=message;
+  inputEl.style.display=input===null?'none':'block';
+  inputEl.value=initialValue;
+  inputEl.placeholder=input||'';
+  cancel.style.display=confirm||input!==null?'inline-block':'none';
+  accept.textContent=input!==null?'שמירה':'אישור';
+  overlay.classList.add('open');
+  const finish=value=>{
+   overlay.classList.remove('open');
+   cancel.onclick=null;accept.onclick=null;overlay.onclick=null;
+   document.removeEventListener('keydown',onKeyDown);
+   resolve(value);
+  };
+  const onKeyDown=event=>{
+   if(event.key==='Escape'&&(confirm||input!==null)){event.preventDefault();finish(input!==null?null:false);}
+   else if(event.key==='Enter'&&input!==null){event.preventDefault();finish(inputEl.value);}
+  };
+  cancel.onclick=()=>finish(input!==null?null:false);
+  accept.onclick=()=>finish(input!==null?inputEl.value:true);
+  overlay.onclick=event=>{if(event.target===overlay&&!confirm&&input===null)finish(true);};
+  document.addEventListener('keydown',onKeyDown);
+  requestAnimationFrame(()=>input!==null?inputEl.focus():accept.focus());
+ });
+ const queued=appDialogQueue.then(openDialog,openDialog);
+ appDialogQueue=queued.then(()=>undefined,()=>undefined);
+ return queued;
+}
+function appAlert(message,title){return showAppDialog(String(message),{title:title||'כתב-יד AI'});}
+function appConfirm(message,title){return showAppDialog(String(message),{title:title||'אישור נדרש',confirm:true});}
+function appPrompt(message,initialValue='',title){return showAppDialog(String(message),{
+ title:title||'עריכת ערך',confirm:true,input:'הקלד ערך',initialValue});}
 let lastLines={lines:[],parLines:[]};
 let chosenFiles=[];
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',
@@ -1184,7 +1392,7 @@ async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET'
 function showTab(id,btn){for(const t of ['tabScan','tabTrain','tabTmpl','tabPar','tabFix'])
  document.getElementById(t).style.display=t===id?'block':'none';
  document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));
- btn.classList.add('active');}
+ btn.classList.add('active');if(id==='tabTrain')refreshExamples();}
 
 /* ---------- קבצים ---------- */
 const drop=document.getElementById('drop');
@@ -1198,9 +1406,12 @@ function addFiles(fl){for(const f of fl)chosenFiles.push(f);
   chosenFiles.length?('נבחרו '+chosenFiles.length+' קבצים: '+chosenFiles.map(f=>f.name).join(', ')):'';}
 function readAsB64(f){return new Promise(res=>{const r=new FileReader();
  r.onload=()=>res(r.result.split(',')[1]);r.readAsDataURL(f);});}
-function readFile(id){return new Promise((res,rej)=>{const f=document.getElementById(id).files[0];
- if(!f){alert('בחר קובץ');rej();return;}const r=new FileReader();
- r.onload=()=>res(r.result.split(',')[1]);r.readAsDataURL(f);});}
+async function readFile(id){const f=document.getElementById(id).files[0];
+ if(!f){await appAlert('בחר קובץ');return null;}
+ return new Promise((res,rej)=>{const r=new FileReader();
+  r.onload=()=>res(r.result.split(',')[1]);
+  r.onerror=()=>rej(new Error('לא ניתן לקרוא את הקובץ שנבחר'));
+  r.readAsDataURL(f);});}
 
 /* ---------- שורות + ניווט מקלדת ---------- */
 function autoGrow(el){el.style.height='auto';el.style.height=Math.max(24,el.scrollHeight)+'px';}
@@ -1211,6 +1422,14 @@ function appendLines(divId,arr,offset){const div=document.getElementById(divId);
    div.dataset.lastSrc=l.src;}
   const row=document.createElement('div');row.className='line';
   const num=document.createElement('span');num.className='num';num.textContent=i+1;
+  if(divId==='lines'){
+   const select=document.createElement('input');select.type='checkbox';
+   select.className='aiRowSelect';select.title='כלול שורה זו בבקשת תיקון AI';
+   select.checked=l.ai_crop!==false;select.disabled=l.ai_crop===false;
+   select.dataset.aiIndex=i;
+   select.addEventListener('change',updateAISelectionControls);
+   row.appendChild(select);
+  }
   const img=document.createElement('img');img.src='data:image/png;base64,'+l.img;
   img.onclick=()=>img.classList.toggle('zoom');
   const inp=document.createElement('textarea');inp.className='lt';inp.rows=1;
@@ -1237,16 +1456,19 @@ function appendLines(divId,arr,offset){const div=document.getElementById(divId);
    row.appendChild(sg);}
   const del=document.createElement('button');del.className='mini';del.textContent='✖';
   del.title='מחק שורה (סרק/קו הדגשה)';
-  del.onclick=()=>{inp.value='';l.text='';row.style.display='none';};
+  del.onclick=()=>{inp.value='';l.text='';row.style.display='none';
+   if(divId==='lines')updateAISelectionControls();};
   const mrg=document.createElement('button');mrg.className='mini';mrg.textContent='⤴';
   mrg.title='מזג את הטקסט לשורה הקודמת';
   mrg.onclick=()=>{const prev=document.querySelector('#'+divId+' textarea.lt[data-i="'+(i-1)+'"]');
-   if(!prev){alert('אין שורה קודמת');return;}
+   if(!prev){appAlert('אין שורה קודמת');return;}
    prev.value=(prev.value.trim()+' '+inp.value.trim()).trim();autoGrow(prev);
    const it=lastLines[divId][i-1];if(it)it.text=prev.value;
-   inp.value='';l.text='';row.style.display='none';};
+   inp.value='';l.text='';row.style.display='none';
+   if(divId==='lines')updateAISelectionControls();};
   row.appendChild(del);row.appendChild(mrg);
-  div.appendChild(row);requestAnimationFrame(()=>autoGrow(inp));});}
+  div.appendChild(row);requestAnimationFrame(()=>autoGrow(inp));});
+ if(divId==='lines')updateAISelectionControls();}
 function attachSugg(divId,i,sugg){/* עדכון 💡 לשורה שכבר הוצגה (מעבר ההקשר השני) */
  const inp=document.querySelector('#'+divId+' textarea.lt[data-i="'+i+'"]');
  if(!inp)return;const row=inp.closest('.line');const l=lastLines[divId][i];if(!l)return;
@@ -1261,12 +1483,451 @@ function moveFocus(divId,i,d){const nxt=document.querySelector('#'+divId+' texta
 function collect(divId){document.querySelectorAll('#'+divId+' textarea.lt').forEach(inp=>{
   const it=lastLines[divId][+inp.dataset.i];if(it)it.text=inp.value;});return lastLines[divId];}
 
+/* ---------- תיקון טיוטה עם AI ---------- */
+let aiCorrections=[],aiMetricsSummary='';
+function getVisibleAILines(syncText=true){
+ const items=syncText?collect('lines'):lastLines.lines,visible=[];
+ document.querySelectorAll('#lines textarea.lt').forEach(inp=>{
+  const row=inp.closest('.line');
+  if(!row||row.style.display==='none')return;
+  const index=Number(inp.dataset.i),item=items[index];
+  if(item)visible.push({
+   index,item,pageKey:item.page==null?item.src:item.page,
+   aiCrop:item.ai_crop!==false,
+   selected:!!row.querySelector('.aiRowSelect')?.checked});
+ });
+ return visible;
+}
+function setAISelection(selected){
+ document.querySelectorAll('#lines .line .aiRowSelect:not(:disabled)').forEach(input=>{
+  if(input.closest('.line').style.display!=='none')input.checked=selected;
+ });
+ updateAISelectionControls();
+}
+function invertAISelection(){
+ document.querySelectorAll('#lines .line .aiRowSelect:not(:disabled)').forEach(input=>{
+  if(input.closest('.line').style.display!=='none')input.checked=!input.checked;
+ });
+ updateAISelectionControls();
+}
+async function selectAILinesByNumber(){
+ const raw=document.getElementById('aiLineNumbers').value.trim(),requested=new Set();
+ if(!raw){await appAlert('הזן מספרי שורות, למשל 1,3-5.');return;}
+ for(const part of raw.split(',')){
+  const match=part.trim().match(/^(\d+)(?:-(\d+))?$/);
+  if(!match){await appAlert(`בחירת שורות לא תקינה: ${part}`);return;}
+  const start=Number(match[1]),end=Number(match[2]||match[1]);
+  if(start<1||end<start||end>lastLines.lines.length){
+   await appAlert(`מספרי שורות חייבים להיות בין 1 ל-${lastLines.lines.length}.`);return;}
+  for(let number=start;number<=end;number++)requested.add(number);
+ }
+ const inputs=[...document.querySelectorAll('#lines .line .aiRowSelect:not(:disabled)')]
+  .filter(input=>input.closest('.line').style.display!=='none');
+ const available=new Set(inputs.map(input=>Number(input.dataset.aiIndex)+1));
+ const missing=[...requested].filter(number=>!available.has(number));
+ if(missing.length){await appAlert(`השורות ${missing.join(', ')} אינן זמינות לשליחה ל-AI.`);return;}
+ document.getElementById('aiScope').value='manual';
+ for(const input of inputs)
+  input.checked=requested.has(Number(input.dataset.aiIndex)+1);
+ updateAISelectionControls();
+}
+function readAISettings(){
+ const number=(id,optional=false)=>{
+  const value=document.getElementById(id).value.trim();
+  return value===''&&optional?null:Number(value);
+ };
+ return {batch_size:number('aiBatchSize'),temperature:number('aiTemperature'),
+  top_p:number('aiTopP',true),top_k:number('aiTopK',true),
+  max_output_tokens:number('aiMaxOutputTokens',true),
+  request_timeout:number('aiRequestTimeout')};
+}
+async function saveAISettings(showMessage=true){
+ const msg=document.getElementById('aiKeyMsg');
+ try{
+  const settings=readAISettings();
+  const r=await api('/api/ai_settings',settings);
+  if(r.error)throw Error(r.error);
+  if(showMessage)msg.textContent='הגדרות תיקון AI נשמרו ומשותפות לתוכנה ול-CLI.';
+  return settings;
+ }catch(e){
+  msg.textContent='שמירת הגדרות AI נכשלה: '+e.message;
+  return null;
+ }
+}
+async function loadAISettings(){
+ try{
+  const s=await api('/api/ai_settings');
+  if(s.error)throw Error(s.error);
+  document.getElementById('aiBatchSize').value=s.batch_size;
+  document.getElementById('aiTemperature').value=s.temperature;
+  document.getElementById('aiTopP').value=s.top_p==null?'':s.top_p;
+  document.getElementById('aiTopK').value=s.top_k==null?'':s.top_k;
+  document.getElementById('aiMaxOutputTokens').value=
+   s.max_output_tokens==null?'':s.max_output_tokens;
+  document.getElementById('aiRequestTimeout').value=s.request_timeout;
+ }catch(e){document.getElementById('aiKeyMsg').textContent=
+  'שגיאה בטעינת הגדרות AI: '+e.message;}
+}
+async function resetAISettings(){
+ if(!await appConfirm('לאפס את פרמטרי תיקון ה-AI לברירות המחדל?'))return;
+ try{
+  const r=await api('/api/ai_settings/reset',{});
+  if(r.error)throw Error(r.error);
+  const s=r.settings;
+  document.getElementById('aiBatchSize').value=s.batch_size;
+  document.getElementById('aiTemperature').value=s.temperature;
+  document.getElementById('aiTopP').value='';
+  document.getElementById('aiTopK').value='';
+  document.getElementById('aiMaxOutputTokens').value='';
+  document.getElementById('aiRequestTimeout').value=s.request_timeout;
+  document.getElementById('aiKeyMsg').textContent='הגדרות AI אופסו.';
+ }catch(e){document.getElementById('aiKeyMsg').textContent=
+  'איפוס הגדרות AI נכשל: '+e.message;}
+}
+function updateAISelectionControls(){
+ const allVisible=getVisibleAILines(false),visible=allVisible.filter(x=>x.aiCrop);
+ const pages=[...new Set(visible.map(x=>x.pageKey))];
+ const scope=document.getElementById('aiScope'),amount=document.getElementById('aiAmount');
+ if(!scope||!amount)return;
+ const manual=scope.value==='manual';
+ document.body.classList.toggle('aiManualSelection',manual);
+ document.getElementById('aiManualControls').style.display=manual?'inline-flex':'none';
+ document.getElementById('aiAmountControl').style.display=manual?'none':'inline';
+ const max=scope.value==='pages'?pages.length:visible.length;
+ amount.max=String(max);
+ amount.value=String(Math.min(Math.max(1,Number(amount.value)||1),Math.max(1,max)));
+ document.getElementById('aiSelectionInfo').textContent=
+  !visible.length&&allVisible.length
+   ? 'לתיקון AI יש לתמלל עם פילוח אוטומטי לשורות.'
+   : manual
+    ? `נבחרו ${visible.filter(x=>x.selected).length} מתוך ${visible.length} שורות זמינות לשליחה.`
+   : scope.value==='pages'
+    ? `${pages.length} עמודים זמינים; יישלחו חיתוכי השורות של ${Math.min(Number(amount.value),pages.length)} עמודים.`
+    : `${visible.length} שורות זמינות; יישלחו ${Math.min(Number(amount.value),visible.length)} חיתוכים.`;
+}
+async function aiCorrect(){
+ updateAISelectionControls();
+ const allVisible=getVisibleAILines(),visible=allVisible.filter(x=>x.aiCrop);
+ const scope=document.getElementById('aiScope').value;
+ const amount=Number(document.getElementById('aiAmount').value);
+ const pages=[...new Set(visible.map(x=>x.pageKey))];
+ const selected=scope==='manual'
+  ? visible.filter(x=>x.selected)
+  : scope==='pages'
+   ? visible.filter(x=>pages.slice(0,amount).includes(x.pageKey))
+   : visible.slice(0,amount);
+ if(!selected.length){
+  await appAlert(allVisible.some(x=>!x.aiCrop)
+   ? 'כדי לשלוח חיתוכי שורות ל-AI, סמן "עמודים מלאים (פילוח אוטומטי לשורות)" ותמלל מחדש.'
+   : scope==='manual'?'סמן לפחות שורה אחת לשליחה לתיקון AI.':'אין שורות גלויות לשליחה לתיקון');
+  return;
+ }
+ const btn=document.getElementById('aiCorrectBtn'),msg=document.getElementById('saveMsg');
+ btn.disabled=true;msg.textContent=`שולח ${selected.length} חיתוכי שורות ל-Google AI Studio...`;
+ try{
+  const settings=await saveAISettings(false);
+  if(!settings)throw Error(document.getElementById('aiKeyMsg').textContent);
+  const r=await api('/api/ai_correct',{
+   lines:selected.map(x=>({img:x.item.img,text:x.item.text})),
+   ...settings,key_id:document.getElementById('aiKeyChoice').value||null});
+  if(r.error)throw Error(r.error);
+  aiCorrections=(r.corrections||[]).map(c=>({
+   ...c,index:selected[c.index].index,lineNumber:selected[c.index].index+1,
+   original:selected[c.index].item.text,applied:false,skipped:false}));
+  renderAIReview(r.keys_used||[],r.metrics||{},r.warning||'');
+  msg.textContent=`התקבלו ${aiCorrections.length} הצעות. הן עדיין טיוטה ולא נשמרו.`+
+   (r.warning?' '+r.warning:'');
+ }catch(e){msg.textContent='';await appAlert('תיקון AI נכשל: '+e.message,'תיקון AI נכשל');}
+ finally{btn.disabled=false;}}
+function renderAIReview(keys,metrics,warning){
+ const panel=document.getElementById('aiReview'),list=document.getElementById('aiReviewList');
+ list.replaceChildren();
+ const usage=metrics.total_tokens==null?'טוקנים: לא דווחו על ידי השירות':
+  `טוקנים: ${metrics.total_tokens} בסך הכול (קלט ${metrics.prompt_tokens}, פלט ${metrics.output_tokens})`;
+ const batches=(metrics.batches||[]).map((b,i)=>
+  `בקשה ${i+1}: ${b.line_count} שורות, ${(b.image_bytes/1024).toFixed(1)}KB תמונות, `+
+  `${(b.request_bytes/1024).toFixed(1)}KB נשלחו, `+
+  `${b.elapsed_seconds}s, ${b.total_tokens==null?'טוקנים לא דווחו':b.total_tokens+' טוקנים'}`).join(' · ');
+ const generation=metrics.generation||{};
+ const stats=`${metrics.line_count||0} שורות ב-${metrics.batch_count||0} בקשות; `+
+  `זמן כולל ${metrics.elapsed_seconds||0}s; ${usage}. ${batches}. `+
+  `פרמטרים: batch=${metrics.batch_size||'—'}, temperature=${generation.temperature??'—'}, `+
+  `top-p=${generation.top_p??'ברירת מחדל'}, top-k=${generation.top_k??'ברירת מחדל'}, `+
+  `max tokens=${generation.max_output_tokens??'ברירת מחדל'}, timeout=${generation.request_timeout??'—'}s. `+
+  `יתרת מכסה אינה מדווחת דרך בקשת התיקון; טוקני הקלט כוללים גם תמונות.`+
+  (warning?` ${warning}`:'');
+ aiMetricsSummary=stats;
+ if(!aiCorrections.length){panel.style.display='block';
+  document.getElementById('aiReviewMsg').textContent='לא נמצאו שורות לשינוי. '+stats;
+  return;}
+ panel.style.display='block';
+ for(const c of aiCorrections){
+  const row=document.createElement('div');row.className='line';row.style.cssText='padding:8px;border-bottom:1px solid #e3e7ef;flex-wrap:wrap';
+  const label=document.createElement('b');label.textContent='שורה '+c.lineNumber+': ';
+  const before=document.createElement('span');before.className='muted';before.textContent='זוהה: '+c.original;
+  const after=document.createElement('span');after.style.cssText='font-weight:600;color:#145c42';after.textContent='הצעת AI: '+c.text;
+  const apply=document.createElement('button');apply.className='btn green';apply.textContent='החל לטיוטה';
+  apply.onclick=()=>{applyAICorrection(c);apply.disabled=true;apply.textContent='הוחל בטיוטה';};
+  const skip=document.createElement('button');skip.className='btn';skip.textContent='השאר מקור';
+  skip.onclick=()=>{c.skipped=true;row.style.display='none';updateAIReviewStatus();};
+  row.append(label,before,after,apply,skip);list.appendChild(row);}
+ document.getElementById('aiReviewMsg').textContent=
+  `${stats}. מפתח/ות: ${keys.length?keys.join(', '):'—'}. `+
+  `ההצעות לא נשמרות עד שתלחץ בעצמך על שמירה לאימון.`;
+}
+function applyAICorrection(c){
+ const item=lastLines.lines[c.index];
+ const input=document.querySelector('#lines textarea.lt[data-i="'+c.index+'"]');
+ if(!item||!input)return;
+ item.text=c.text;input.value=c.text;autoGrow(input);c.applied=true;updateAIReviewStatus();}
+function applyAllAICorrections(){
+ let applied=0;
+ for(const c of aiCorrections){if(!c.applied&&!c.skipped){applyAICorrection(c);applied++;}}
+ document.getElementById('aiReviewMsg').textContent=
+  'הוחלו '+applied+' הצעות בטיוטה. עבור על הטקסט וערוך לפי הצורך לפני שמירה לאימון. '+
+  aiMetricsSummary;}
+function updateAIReviewStatus(){
+ const applied=aiCorrections.filter(c=>c.applied).length;
+ const skipped=aiCorrections.filter(c=>c.skipped).length;
+ document.getElementById('aiReviewMsg').textContent=
+  'הוחלו '+applied+' הצעות בטיוטה; '+skipped+' נדחו. ניתן לערוך את השורות לפני שמירה לאימון. '+
+  aiMetricsSummary;}
+let aiKeyChecks=Object.create(null);
+let aiModelTests=Object.create(null);
+function aiKeyStatusText(check){
+ if(!check)return 'לא נבדק';
+ const labels={
+  connected:'✅ מחובר — מכסת יצירה לא נבדקה',
+  rejected:'❌ מפתח נדחה/אין הרשאה',
+  quota:'⚠️ שירות דיווח על מכסה/קצב',
+  unreachable:'⚠️ אין חיבור ל-Google',
+  service_error:'⚠️ שגיאת שירות'
+ };
+ const checked=check.checked_at?new Date(check.checked_at).toLocaleString():'';
+ return `${labels[check.status]||'⚠️ סטטוס לא ידוע'}${check.detail?' — '+check.detail:''}`+
+  `${checked?' · נבדק '+checked:''} · ${check.elapsed_seconds}s`;
+}
+async function checkAIKey(id){
+ const msg=document.getElementById('aiKeyMsg');
+ try{
+  const r=await api('/api/ai_keys/check',{id});
+  if(r.error)throw Error(r.error);
+  aiKeyChecks[r.result.id]=r.result;renderAIKeyList();
+ }catch(e){msg.textContent='בדיקת החיבור נכשלה: '+e.message;}
+}
+async function loadAIModels(id){
+ const msg=document.getElementById('aiKeyMsg');
+ try{
+  const r=await api('/api/ai_keys/models',{id});
+  if(r.error)throw Error(r.error);
+  aiModelCatalog[id]=r.models;
+  delete aiModelTests[id];
+  renderAIKeyList();
+  msg.textContent=`Google מציג ${r.models.length} מודלים שתומכים ביצירת תוכן עבור ${r.name}. `+
+   'הרשימה אינה מבטיחה שהמודל יענה כרגע; שגיאת 503 בדרך כלל מציינת עומס זמני.';
+ }catch(e){msg.textContent='טעינת רשימת המודלים נכשלה: '+e.message;}
+}
+const aiModelTestLabels={
+ working:'✅ יצירה הצליחה',
+ quota:'⚠️ מכסה/קצב',
+ overloaded:'⏳ עומס זמני',
+ unavailable:'❌ המודל אינו זמין',
+ unsupported:'⚠️ הבקשה אינה נתמכת',
+ access_denied:'❌ אין הרשאה',
+ unreachable:'⚠️ אין חיבור',
+ no_response:'⚠️ לא התקבל טקסט',
+ service_error:'⚠️ שגיאת שירות'
+};
+function recommendedAIModel(id){
+ const results=aiModelTests[id]?.results||{};
+ const working=Object.values(results).filter(result=>result.status==='working');
+ const priority=['gemini-3.1-flash-lite','gemini-3.1-flash-lite-preview',
+  'gemini-3.5-flash-lite','gemini-flash-lite-latest','gemini-3.5-flash',
+  'gemini-3.6-flash','gemini-3.7-flash','gemini-3-flash-preview'];
+ for(const model of priority){const result=working.find(item=>item.id===model);if(result)return result;}
+ return working[0]||null;
+}
+async function testAIModels(id){
+ const models=aiModelCatalog[id]||[],msg=document.getElementById('aiKeyMsg');
+ if(!models.length){msg.textContent='תחילה טען את רשימת המודלים למפתח הזה.';return;}
+ if(!await appConfirm(`תישלח בקשת יצירה קצרה לכל אחד מ-${models.length} המודלים ברשימה. `+
+  'הבדיקה פונה ל-Google בפועל ועשויה לצרוך מכסה. להמשיך?'))return;
+ const state=aiModelTests[id]={results:Object.create(null),running:true,completed:0,total:models.length};
+ renderAIKeyList();
+ for(const model of models){
+  try{
+   const r=await api('/api/ai_keys/test_model',{id,model:model.id});
+   if(r.error)throw Error(r.error);
+   state.results[model.id]=r.result;
+  }catch(e){
+   state.results[model.id]={id:model.id,status:'service_error',detail:e.message};
+  }
+  state.completed++;
+  renderAIKeyList();
+ }
+ state.running=false;
+ renderAIKeyList();
+ const recommendation=recommendedAIModel(id);
+ msg.textContent=recommendation
+  ? `הבדיקה הסתיימה. מומלץ כרגע: ${recommendation.id}. אפשר לבחור בו מהרשימה.`
+  : 'הבדיקה הסתיימה; אף מודל לא החזיר תשובת טקסט תקינה. בדוק את הסיבות לכל מודל.';
+}
+async function saveAIKeyModel(id,model){
+ const msg=document.getElementById('aiKeyMsg');
+ try{
+  const r=await api('/api/ai_keys/model',{id,model});
+  if(r.error)throw Error(r.error);
+  const key=aiKeyList.find(item=>item.id===id);
+  if(key)key.model=r.key.model;
+  delete aiKeyChecks[id];
+  renderAIKeyList();
+  msg.textContent=`המודל ${r.key.model} נשמר עבור המפתח ${r.key.name}; בודק גישה...`;
+  await checkAIKey(id);
+ }catch(e){msg.textContent='שמירת המודל נכשלה: '+e.message;await loadAIKeys();}
+}
+async function checkAllAIKeys(){
+ const btn=document.getElementById('aiKeysCheckAll'),msg=document.getElementById('aiKeyMsg');
+ btn.disabled=true;btn.textContent='בודק חיבור...';
+ try{
+  const r=await api('/api/ai_keys/check',{});
+  if(r.error)throw Error(r.error);
+  for(const result of r.results)aiKeyChecks[result.id]=result;
+  renderAIKeyList();
+  const connected=r.results.filter(x=>x.status==='connected').length;
+  msg.textContent=`נבדקו ${r.results.length} מפתחות; ${connected} התחברו בהצלחה. בדיקה זו אינה מוודאת מכסת יצירת תוכן.`;
+ }catch(e){msg.textContent='רענון בדיקת החיבור נכשל: '+e.message;}
+ finally{btn.disabled=false;btn.textContent='🔄 בדוק/רענן חיבור לכל המפתחות';}
+}
+function renderAIKeyList(){
+ const list=document.getElementById('aiKeyList');
+ list.replaceChildren();
+ renderAIKeySelector();
+ const keys=aiKeyList;
+ if(!keys.length){list.textContent='לא נשמרו מפתחות עדיין.';return;}
+ for(const key of keys){
+  const row=document.createElement('div');row.style.cssText='margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap';
+  const name=document.createElement('input');name.type='text';name.maxLength=60;
+  name.value=key.name;name.title='שם המפתח השמור';name.style.width='150px';
+  const rename=document.createElement('button');rename.className='mini';
+  rename.textContent='שמור שם';rename.onclick=()=>renameAIKey(key.id,name.value);
+  const status=document.createElement('span');status.textContent=aiKeyStatusText(aiKeyChecks[key.id]);
+  status.title=aiKeyChecks[key.id]?aiKeyChecks[key.id].detail:'';
+  const modelSelect=document.createElement('select');
+  const models=aiModelCatalog[key.id]||[];
+  const selectedAvailable=models.some(model=>model.id===key.model);
+  const selectedOption=document.createElement('option');
+  selectedOption.value=key.model;
+  selectedOption.textContent=selectedAvailable
+   ? `${key.model} (מופיע ברשימת Google)`
+   : `${key.model} (ברירת מחדל; טרם אומת מול Google)`;
+  modelSelect.appendChild(selectedOption);
+  for(const model of models){
+   if(model.id===key.model)continue;
+   const option=document.createElement('option');
+   option.value=model.id;
+   const tested=aiModelTests[key.id]?.results?.[model.id];
+   option.textContent=`${model.display_name} — ${model.id}`+
+    (tested?` · ${aiModelTestLabels[tested.status]||tested.status}`:'');
+   option.title=model.description||'';
+   modelSelect.appendChild(option);
+  }
+  modelSelect.value=key.model;
+  modelSelect.disabled=!models.length;
+  modelSelect.title=models.length
+   ? 'המודל שבו ישתמש מפתח זה בתיקון AI'
+   : 'לחץ על „טען מודלים” כדי לקבל את המודלים הזמינים למפתח';
+  modelSelect.onchange=()=>saveAIKeyModel(key.id,modelSelect.value);
+  const test=document.createElement('button');test.className='mini';test.textContent='בדוק חיבור';
+  test.onclick=()=>checkAIKey(key.id);
+  const refreshModels=document.createElement('button');refreshModels.className='mini';
+  refreshModels.textContent='טען מודלים';
+  refreshModels.onclick=()=>loadAIModels(key.id);
+  const testModels=document.createElement('button');testModels.className='mini';
+  testModels.textContent=aiModelTests[key.id]?.running?'בודק מודלים...':'בדוק מודלים בפועל';
+  testModels.disabled=!models.length||!!aiModelTests[key.id]?.running;
+  testModels.onclick=()=>testAIModels(key.id);
+  const remove=document.createElement('button');remove.className='mini';remove.textContent='הסר';
+  remove.onclick=()=>removeAIKey(key.id);
+  row.append(name,rename,modelSelect,refreshModels,testModels,status,test,remove);list.appendChild(row);
+  const testState=aiModelTests[key.id];
+  if(testState){
+   const results=document.createElement('div');
+   results.style.cssText='margin:4px 0 10px 24px;padding:8px 12px;background:#f6f8fc;border-radius:8px';
+   if(testState.running){
+    const progress=document.createElement('div');progress.className='muted';
+    progress.textContent=`בודק מודלים: ${testState.completed} מתוך ${testState.total} הושלמו.`;
+    results.appendChild(progress);
+   }
+   for(const model of models){
+    const tested=testState.results[model.id];if(!tested)continue;
+    const line=document.createElement('div');line.className='muted';
+    line.textContent=`${model.display_name} (${model.id}) — `+
+     `${aiModelTestLabels[tested.status]||tested.status}: ${tested.detail}`;
+    results.appendChild(line);
+   }
+   const recommendation=recommendedAIModel(key.id);
+   if(recommendation){
+    const rec=document.createElement('div');rec.style.cssText='margin-top:6px;font-weight:600;color:#145c42';
+    rec.textContent=`מומלץ כרגע: ${recommendation.id} — הבדיקה הצליחה.`;
+    const choose=document.createElement('button');choose.className='mini';
+    choose.textContent='בחר מודל מומלץ';choose.onclick=()=>saveAIKeyModel(key.id,recommendation.id);
+    results.append(rec,choose);
+   }else if(!testState.running&&testState.completed){
+    const none=document.createElement('div');none.className='muted';
+    none.textContent='לא נמצא מודל שהחזיר תשובת טקסט תקינה בבדיקה.';
+    results.appendChild(none);
+   }
+   list.appendChild(results);
+  }
+ }
+}
+function renderAIKeySelector(){
+ const select=document.getElementById('aiKeyChoice');if(!select)return;
+ const selected=select.value;
+ select.replaceChildren(new Option('בחירה אוטומטית',''));
+ for(const key of aiKeyList)select.appendChild(new Option(key.name,key.id));
+ select.value=aiKeyList.some(key=>key.id===selected)?selected:'';
+}
+let aiKeyList=[];
+let aiModelCatalog=Object.create(null);
+async function loadAIKeys(){try{const r=await api('/api/ai_keys');
+ if(r.error)throw Error(r.error);
+ aiKeyList=r.keys;
+ const currentIds=new Set(aiKeyList.map(key=>key.id));
+ for(const id of Object.keys(aiKeyChecks))if(!currentIds.has(id))delete aiKeyChecks[id];
+ for(const id of Object.keys(aiModelCatalog))if(!currentIds.has(id))delete aiModelCatalog[id];
+ for(const id of Object.keys(aiModelTests))if(!currentIds.has(id))delete aiModelTests[id];
+ renderAIKeyList();
+ }catch(e){document.getElementById('aiKeyMsg').textContent='שגיאה בטעינת המפתחות: '+e.message;}}
+async function addAIKey(){const name=document.getElementById('aiKeyName').value.trim();
+ const key=document.getElementById('aiKeyValue').value.trim(),msg=document.getElementById('aiKeyMsg');
+ if(!name||!key){msg.textContent='צריך למלא שם ומפתח API.';return;}
+ try{const r=await api('/api/ai_keys/add',{name:name,key:key});
+ if(r.error)throw Error(r.error);
+ document.getElementById('aiKeyName').value=''; document.getElementById('aiKeyValue').value='';
+ msg.textContent='המפתח נשמר בהצפנה במחשב. לחץ על „בדוק חיבור” כדי לבדוק אותו מול Google.';
+ await loadAIKeys();
+ }catch(e){msg.textContent='לא ניתן לשמור את המפתח: '+e.message;}}
+async function renameAIKey(id,name){
+ const msg=document.getElementById('aiKeyMsg');
+ try{const r=await api('/api/ai_keys/rename',{id:id,name:name.trim()});
+ if(r.error)throw Error(r.error);
+ msg.textContent='שם המפתח עודכן ונשמר לנתוני התוכנה.';
+ await loadAIKeys();
+ }catch(e){msg.textContent='לא ניתן לשנות את שם המפתח: '+e.message;}}
+async function removeAIKey(id){if(!await appConfirm('להסיר את מפתח ה-API הזה?'))return;
+ try{const r=await api('/api/ai_keys/remove',{id:id});
+ if(r.error)throw Error(r.error);
+ await loadAIKeys();}catch(e){await appAlert('לא ניתן להסיר את המפתח: '+e.message,'הסרת מפתח נכשלה');}}
+
 /* ---------- תמלול חי ---------- */
 function setUploadLock(on){document.getElementById('drop').classList.toggle('disabled',on);
  document.getElementById('btnGo').disabled=on;}
-async function transcribe(){if(!chosenFiles.length){alert('בחר קבצים קודם');return;}
+async function transcribe(){if(!chosenFiles.length){await appAlert('בחר קבצים קודם');return;}
  const btn=document.getElementById('btnGo');setUploadLock(true);btn.textContent='מתמלל...';
+ document.getElementById('modelUsed').textContent='מזהה מודל...';
  lastLines.lines=[];const linesDiv=document.getElementById('lines');
+ document.getElementById('aiReview').style.display='none';aiCorrections=[];
  linesDiv.innerHTML='';linesDiv.dataset.lastSrc='';
  document.getElementById('resultsCard').style.display='none';
  document.getElementById('scanProg').style.display='block';
@@ -1277,9 +1938,12 @@ async function transcribe(){if(!chosenFiles.length){alert('בחר קבצים ק�
    fix:document.getElementById('fixMode').checked});
   while(true){
    const s=await api('/api/transcribe_status',{job:start.job,from:lastLines.lines.length});
-   if(s.model)document.getElementById('modelUsed').textContent='מתמלל עם: '+
-    (s.model==='__base__'?'מודל הבסיס':s.model==='__general__'?'המודל הכללי':
-     s.model==='__typed__'?'מודל הטקסט המוקלד':'המודל האישי של '+s.model);
+   if(s.models_used&&s.models_used.length){
+    const names=s.models_used.map(model=>model==='__base__'?'מודל הבסיס':
+     model==='__general__'?'המודל הכללי':
+     model==='__typed__'?'מודל הטקסט המוקלד':'המודל האישי של '+model);
+    document.getElementById('modelUsed').textContent='בפועל: '+names.join(' + ');
+   }
    if(s.lines&&s.lines.length){const off=lastLines.lines.length;
     s.lines.forEach(l=>l.orig=l.text);  /* שמירת המקור ללמידת תיקונים */
     lastLines.lines.push(...s.lines);appendLines('lines',s.lines,off);
@@ -1291,15 +1955,18 @@ async function transcribe(){if(!chosenFiles.length){alert('בחר קבצים ק�
     (s.pages_total>1?('עמוד '+Math.min(s.pages_done+1,s.pages_total)+'/'+s.pages_total+' · '):'')+
     (s.cur||'')+' · '+lastLines.lines.length+' שורות עד כה';
    if(s.done||s.error){
+    if(s.error&&(!s.models_used||!s.models_used.length))
+     document.getElementById('modelUsed').textContent='לא נבחר מודל';
     if(s.suggs)for(const k in s.suggs)attachSugg('lines',+k,s.suggs[k]);
-    if(s.error)alert(s.error);break;}
+    if(s.error)await appAlert(s.error,'שגיאת תמלול');break;}
    await new Promise(r=>setTimeout(r,700));}
- }catch(e){alert('שגיאה: '+e);}
+ }catch(e){document.getElementById('modelUsed').textContent='התמלול נכשל';
+  await appAlert('שגיאה: '+e,'התמלול נכשל');}
  document.getElementById('scanProg').style.display='none';
  setUploadLock(false);btn.textContent='🚀 תמלל הכול';
  chosenFiles=[];document.getElementById('fileList').textContent='';
  document.getElementById('file').value='';
- if(!lastLines.lines.length)alert('לא זוהו שורות');}
+ if(!lastLines.lines.length)await appAlert('לא זוהו שורות');}
 
 /* ---------- ייצוא ---------- */
 function expMode(){return document.querySelector('input[name=expMode]:checked').value;}
@@ -1333,7 +2000,7 @@ async function downloadDocxLayout(){const items=collect('lines')
  const blob=await r.blob();const a=document.createElement('a');
  a.href=URL.createObjectURL(blob);a.download='transcript_layout.docx';a.click();}
 async function saveAll(divId,msgId){const w=document.getElementById('writer').value;
- if(!w){alert('הוסף כותב קודם (בלשונית האימון)');return;}
+ if(!w){await appAlert('הוסף כותב קודם (בלשונית האימון)');return;}
  const r=await api('/api/save',{writer:w,lines:collect(divId)});
  let msg='נשמרו '+r.saved+' שורות ✓';
  if(r.quarantined)msg+=' · '+r.quarantined+' ממתינות לאישור בהסגר (בלשונית האימון)';
@@ -1343,7 +2010,7 @@ async function saveAll(divId,msgId){const w=document.getElementById('writer').va
 /* ---------- מודל התיקונים ---------- */
 async function deepSuggest(){const w=document.getElementById('writer').value;
  const items=collect('lines');
- if(!items||!items.length){alert('אין תמלול לנתח');return;}
+ if(!items||!items.length){await appAlert('אין תמלול לנתח');return;}
  const msg=document.getElementById('saveMsg');
  msg.textContent='🧠 מנתח את כל המסמך (הקשר מלא + רצף חוצה-שורות)...';
  try{
@@ -1360,7 +2027,7 @@ async function saveFixes(){const w=document.getElementById('writer').value;
  collect('lines');
  const items=lastLines.lines.filter(l=>l.orig&&l.text&&l.orig!==l.text)
   .map(l=>({orig:l.orig,final:l.text}));
- if(!items.length){alert('אין תיקונים ללמידה — ערוך שורות או החל הצעות קודם');return;}
+ if(!items.length){await appAlert('אין תיקונים ללמידה — ערוך שורות או החל הצעות קודם');return;}
  const r=await api('/api/save_fixes',{writer:w,scope:document.getElementById('fixScope').value,lines:items});
  document.getElementById('saveMsg').textContent=r.msg;loadFixStats();}
 async function loadFixStats(){try{const w=document.getElementById('writer').value;
@@ -1378,13 +2045,13 @@ async function loadFixStats(){try{const w=document.getElementById('writer').valu
   const td=document.createElement('td');
   const ed=document.createElement('button');ed.className='mini';ed.textContent='✏️';
   ed.title='עריכת התיקון — הצורה שתקליד תהפוך לרוב הקובע';
-  ed.onclick=async()=>{const nr=prompt('הצורה הנכונה עבור "'+t.wrong+'":',t.right);
+  ed.onclick=async()=>{const nr=await appPrompt('הצורה הנכונה עבור "'+t.wrong+'":',t.right);
    if(!nr||!nr.trim()||nr.trim()===t.right)return;
    const r=await api('/api/fixes_override',{writer:w,wrong:t.wrong,right:nr.trim()});
    document.getElementById('fixClearMsg').textContent=r.msg;loadFixStats();};
   const dl=document.createElement('button');dl.className='mini';dl.textContent='🗑';
   dl.title='הסרת התיקון מהמודל לגמרי (לא יוצע יותר)';
-  dl.onclick=async()=>{if(!confirm('להסיר את התיקון "'+t.wrong+' ← '+t.right+'" מהמודל?'))return;
+  dl.onclick=async()=>{if(!await appConfirm('להסיר את התיקון "'+t.wrong+' ← '+t.right+'" מהמודל?'))return;
    const r=await api('/api/fixes_remove',{writer:w,wrong:t.wrong});
    document.getElementById('fixClearMsg').textContent=r.msg;loadFixStats();};
   td.appendChild(ed);td.appendChild(dl);tr.appendChild(td);
@@ -1395,6 +2062,7 @@ async function clearFixes(){const w=document.getElementById('writer').value;
  const r=await api('/api/fixes_clear',{writer:w});
  document.getElementById('fixClearMsg').textContent=r.msg;loadFixStats();}
 async function importFixes(){const b64=await readFile('fixFile');
+ if(!b64)return;
  const r=await api('/api/import_fixes',{file:b64});
  document.getElementById('fixMsg').textContent=r.msg;loadFixStats();}
 
@@ -1420,47 +2088,49 @@ async function refreshQuar(){const w=document.getElementById('writer').value;
   why.title=it.reason;why.style.maxWidth='230px';why.style.overflow='hidden';why.style.textOverflow='ellipsis';
   const ok=document.createElement('button');ok.className='btn green';ok.textContent='אשר';
   ok.onclick=async()=>{const r=await api('/api/quarantine_resolve',{writer:w,file:it.file,approve:true,text:inp.value});
-   if(!r.ok)alert(r.msg);refreshQuar();refreshAll(w);};
+   if(!r.ok)await appAlert(r.msg,'אישור שורה נכשל');refreshQuar();refreshAll(w);};
   const no=document.createElement('button');no.className='btn red';no.textContent='מחק';
   no.onclick=async()=>{await api('/api/quarantine_resolve',{writer:w,file:it.file,approve:false});refreshQuar();refreshAll(w);};
   row.appendChild(img);row.appendChild(inp);row.appendChild(why);row.appendChild(ok);row.appendChild(no);
   div.appendChild(row);requestAnimationFrame(()=>autoGrow(inp));}}
 
 /* ---------- אימון ---------- */
-async function train(scope){const w=document.getElementById('writer').value;
+async function train(scope,resume){const w=document.getElementById('writer').value;
  scope=scope||document.getElementById('trainScope').value;
- if(scope!=='general'&&!w){alert('בחר כותב');return;}
- const r=await api('/api/train',{writer:w,scope:scope});
- if(!r.ok)alert(r.msg);else document.getElementById('trainIdle').textContent=r.msg;}
+ if(scope!=='general'&&!w){await appAlert('בחר כותב');return;}
+ if(resume===false&&!await appConfirm('Start a fresh run from the base/general model? The interrupted checkpoint will be kept as a backup.'))return;
+ const r=await api('/api/train',{writer:w,scope:scope,resume:resume!==false});
+ if(!r.ok)await appAlert(r.msg,'האימון לא התחיל');else document.getElementById('trainIdle').textContent=r.msg;}
 async function importGeneral(){const b64=await readFile('generalFile');
+ if(!b64)return;
  document.getElementById('generalMsg').textContent='מעדכן...';
  const r=await api('/api/import_general',{file:b64});
  document.getElementById('generalMsg').textContent=r.msg;
- if(r.ok&&confirm('המודל הכללי עודכן בהצלחה!\nהאם תרצה לעדכן את נתוני האימון האישיים שלך במודל הראשי של התוכנה? (מומלץ — כך המודל החדש ילמד גם את כתב היד שלך)')){
+ if(r.ok&&await appConfirm('המודל הכללי עודכן בהצלחה!\nהאם תרצה לעדכן את נתוני האימון האישיים שלך במודל הראשי של התוכנה? (מומלץ — כך המודל החדש ילמד גם את כתב היד שלך)')){
   train('general');}}
 async function uploadPack(){const w=document.getElementById('writer').value;
- if(!w){alert('בחר כותב');return;}
- if(!confirm('לשלוח את נתוני האימון של "'+w+'" למפתח התוכנה?\nנשלחים רק נתונים שאתה יצרת (תמונות שורות והטקסט שלהן).'))return;
+ if(!w){await appAlert('בחר כותב');return;}
+ if(!await appConfirm('לשלוח את נתוני האימון של "'+w+'" למפתח התוכנה?\nנשלחים רק נתונים שאתה יצרת (תמונות שורות והטקסט שלהן).'))return;
  document.getElementById('uploadMsg').textContent='שולח... (זה יכול לקחת דקה)';
  const r=await api('/api/upload_pack',{writer:w});
  document.getElementById('uploadMsg').textContent=r.msg;}
 async function saveConfig(){const r=await api('/api/config',{upload_url:document.getElementById('uploadUrl').value.trim()});
- alert('נשמר');}
+ await appAlert('נשמר','ההגדרות נשמרו');}
 async function deleteTrainData(){const w=document.getElementById('writer').value;
  const msg=document.getElementById('cleanMsg');
- if(!w){alert('בחר כותב');return;}
- if(!confirm('למחוק את קובצי האימון של "'+w+'"?\n\nלא מומלץ: הקבצים משמשים גיבוי ויידרשו לאימון מחדש אחרי עדכון מודל עתידי.\nהמודלים המאומנים לא יימחקו והתמלול ימשיך לעבוד כרגיל.'))return;
- if(confirm('לשלוח את הנתונים למפתח לפני המחיקה?\n(מומלץ — כך הם ישפרו את המודל הכללי ולא ילכו לאיבוד)')){
+ if(!w){await appAlert('בחר כותב');return;}
+ if(!await appConfirm('למחוק את קובצי האימון של "'+w+'"?\n\nלא מומלץ: הקבצים משמשים גיבוי ויידרשו לאימון מחדש אחרי עדכון מודל עתידי.\nהמודלים המאומנים לא יימחקו והתמלול ימשיך לעבוד כרגיל.'))return;
+ if(await appConfirm('לשלוח את הנתונים למפתח לפני המחיקה?\n(מומלץ — כך הם ישפרו את המודל הכללי ולא ילכו לאיבוד)')){
   msg.textContent='שולח למפתח לפני המחיקה... (זה יכול לקחת דקה)';
   const u=await api('/api/upload_pack',{writer:w});
-  if(!u.ok&&!confirm('השליחה נכשלה: '+u.msg+'\nלמחוק בכל זאת?')){msg.textContent=u.msg;return;}}
+  if(!u.ok&&!await appConfirm('השליחה נכשלה: '+u.msg+'\nלמחוק בכל זאת?')){msg.textContent=u.msg;return;}}
  const r=await api('/api/delete_train_data',{writer:w});
  msg.textContent=r.msg;refreshAll(w);}
 async function loadConfig(){try{const c=await api('/api/config');
  if(c.upload_url)document.getElementById('uploadUrl').value=c.upload_url;}catch(e){}}
 loadConfig();
 async function stopTrain(){const r=await api('/api/train_stop',{});
- if(!r.stopped)alert('לא נמצא אימון רץ');}
+ if(!r.stopped)await appAlert('לא נמצא אימון רץ');}
 function drawCer(cers){const el=document.getElementById('cerChart');
  if(!cers||!cers.length){el.textContent='אין נתונים עדיין';return;}
  const w=460,h=130,max=Math.max(...cers,1),n=cers.length;
@@ -1507,53 +2177,109 @@ async function refreshAll(keep){const ws=await api('/api/writers');
   tbl.appendChild(tr);}
  const ts=await api('/api/templates/list');const tsel=document.getElementById('tmplName');
  tsel.innerHTML='';for(const t of ts){const o=document.createElement('option');o.value=t;o.textContent=t;tsel.appendChild(o);}
- refreshQuar();loadFixStats();}
+ refreshQuar();loadFixStats();refreshExamples();}
+
+let examplesOffset=0,examplesLimit=20,examplesWriter='';
+async function refreshExamples(){
+ const writer=document.getElementById('writer').value;
+ const list=document.getElementById('examplesList');
+ const summary=document.getElementById('examplesSummary');
+ if(!writer){list.textContent='';summary.textContent='בחר כותב כדי להציג את דוגמאות האימון';return;}
+ if(writer!==examplesWriter){examplesWriter=writer;examplesOffset=0;}
+ const page=await api('/api/examples?writer='+encodeURIComponent(writer)+
+  '&offset='+examplesOffset+'&limit='+examplesLimit);
+ if(page.error){summary.textContent=page.error;return;}
+ if(page.total>0&&examplesOffset>=page.total){
+  examplesOffset=Math.floor((page.total-1)/examplesLimit)*examplesLimit;
+  return refreshExamples();
+ }
+ if(page.total===0)examplesOffset=0;
+ list.replaceChildren();
+ summary.textContent=page.total+' דוגמאות שמורות';
+ const pageNo=Math.floor(examplesOffset/examplesLimit)+1;
+ const pageCount=Math.max(1,Math.ceil(page.total/examplesLimit));
+ document.getElementById('examplesPage').textContent='עמוד '+pageNo+' מתוך '+pageCount;
+ document.getElementById('examplesPrev').disabled=examplesOffset<=0;
+ document.getElementById('examplesNext').disabled=examplesOffset+examplesLimit>=page.total;
+ for(const item of page.items){
+  const row=document.createElement('div');row.className='line';
+  const image=document.createElement('img');image.src='data:image/png;base64,'+item.img;
+  image.alt='דוגמת אימון '+item.file;image.onclick=()=>image.classList.toggle('zoom');
+  const text=document.createElement('textarea');text.className='lt';text.rows=2;
+  text.value=item.text;text.setAttribute('aria-label','תיוג דוגמת '+item.file);
+  const filename=document.createElement('span');filename.className='muted';
+  filename.textContent=item.file;
+  const save=document.createElement('button');save.className='btn';save.textContent='שמור עריכה';
+  save.onclick=async()=>{
+   const result=await api('/api/examples/edit',{writer,file:item.file,text:text.value});
+   if(!result.ok){await appAlert(result.msg||result.error||'העריכה נכשלה');return;}
+   summary.textContent=result.msg;refreshAll(writer);
+  };
+  const remove=document.createElement('button');remove.className='btn red';remove.textContent='מחק דוגמה';
+  remove.onclick=async()=>{
+   if(!await appConfirm('להסיר לצמיתות את דוגמת האימון "'+item.file+'"?'))return;
+   const result=await api('/api/examples/delete',{writer,file:item.file});
+   if(!result.ok){await appAlert(result.msg||result.error||'המחיקה נכשלה');return;}
+   summary.textContent=result.msg;refreshAll(writer);
+  };
+  row.append(image,text,filename,save,remove);list.appendChild(row);
+ }
+}
+function pageExamples(direction){
+ examplesOffset=Math.max(0,examplesOffset+direction*examplesLimit);
+ refreshExamples();
+}
 async function addWriter(){const n=document.getElementById('newWriter').value.trim();if(!n)return;
  await api('/api/writers',{name:n});document.getElementById('newWriter').value='';refreshAll(n);}
 async function deleteWriter(){const w=document.getElementById('writer').value;
  const msg=document.getElementById('delWriterMsg');
- if(!w){alert('בחר כותב (למעלה, ליד הכותרת)');return;}
- if(!confirm('⚠️ אזהרה חמורה ⚠️\n\nמחיקת הכותב "'+w+'" תמחק לצמיתות:\n• את כל נתוני האימון שלו (תמונות השורות והתיוגים)\n• את המודל האישי המאומן שלו (כולל גרסאות הארכיון)\n\nזה בלתי הפיך! להמשיך?'))return;
- if(confirm('מומלץ מאוד: להוריד עכשיו גיבוי מלא של הכותב (חבילת אימון + המודל)?\n\nאישור = הורדת הגיבוי · ביטול = דילוג על הגיבוי')){
+ if(!w){await appAlert('בחר כותב (למעלה, ליד הכותרת)');return;}
+ if(!await appConfirm('⚠️ אזהרה חמורה ⚠️\n\nמחיקת הכותב "'+w+'" תמחק לצמיתות:\n• את כל נתוני האימון שלו (תמונות השורות והתיוגים)\n• את המודל האישי המאומן שלו (כולל גרסאות הארכיון)\n\nזה בלתי הפיך! להמשיך?'))return;
+ if(await appConfirm('מומלץ מאוד: להוריד עכשיו גיבוי מלא של הכותב (חבילת אימון + המודל)?\n\nאישור = הורדת הגיבוי · ביטול = דילוג על הגיבוי')){
   location.href='/api/export_writer?name='+encodeURIComponent(w);
   await new Promise(r=>setTimeout(r,1500));
-  if(!confirm('הגיבוי החל לרדת (בדוק בתיקיית ההורדות).\n\nלמחוק את "'+w+'" סופית עכשיו?'))return;
- }else if(!confirm('למחוק את "'+w+'" סופית בלי גיבוי?'))return;
+  if(!await appConfirm('הגיבוי החל לרדת (בדוק בתיקיית ההורדות).\n\nלמחוק את "'+w+'" סופית עכשיו?'))return;
+ }else if(!await appConfirm('למחוק את "'+w+'" סופית בלי גיבוי?'))return;
  const r=await api('/api/delete_writer',{writer:w});
- msg.textContent=r.msg;if(!r.ok)alert(r.msg);
+ msg.textContent=r.msg;if(!r.ok)await appAlert(r.msg,'מחיקת כותב נכשלה');
  refreshAll();}
 async function makeTemplates(){const r=await api('/api/templates/make',{count:10});
  document.getElementById('tmplMsg').textContent='נוצרו: '+r.made.join(', ');refreshAll();}
 async function makeCustom(){const t=document.getElementById('customText').value;
- if(!t.trim()){alert('הקלד משפטים');return;}
+ if(!t.trim()){await appAlert('הקלד משפטים');return;}
  const r=await api('/api/templates/custom',{text:t});
  document.getElementById('customMsg').textContent='נוצרו: '+r.made.join(', ')+' — הורד ZIP והדפס';refreshAll();}
 async function ingestTemplate(){const w=document.getElementById('writer').value;
- if(!w){alert('בחר כותב');return;}
+ if(!w){await appAlert('בחר כותב');return;}
  const b64=await readFile('tmplFile');
+ if(!b64)return;
  const r=await api('/api/ingest_template',{img:b64,template:document.getElementById('tmplName').value,writer:w});
  document.getElementById('ingestMsg').textContent=r.msg;refreshAll(w);}
 async function parallelMatch(){const b64=await readFile('parFile');
+ if(!b64)return;
  const r=await api('/api/parallel',{img:b64,text:document.getElementById('parText').value});
  lastLines.parLines=r.lines||[];document.getElementById('parLines').innerHTML='';
  document.getElementById('parLines').dataset.lastSrc='';
  appendLines('parLines',lastLines.parLines,0);
  document.getElementById('parCard').style.display='block';
  document.getElementById('parMsg').textContent=r.note||'';}
-function exportPack(){const w=document.getElementById('writer').value;
- if(!w){alert('בחר כותב');return;}
+async function exportPack(){const w=document.getElementById('writer').value;
+ if(!w){await appAlert('בחר כותב');return;}
  location.href='/api/export_writer?name='+encodeURIComponent(w);}
 async function importPack(){const w=document.getElementById('packWriter').value.trim();
- if(!w){alert('תן שם לכותב');return;}
+ if(!w){await appAlert('תן שם לכותב');return;}
  const b64=await readFile('packFile');
+ if(!b64)return;
  const r=await api('/api/import_pack',{zip:b64,writer:w});
  document.getElementById('packMsg').textContent=r.msg;refreshAll(w);}
 async function importModel(){const n=document.getElementById('modelName').value.trim();
- if(!n){alert('תן שם');return;}
+ if(!n){await appAlert('תן שם');return;}
  const b64=await readFile('modelFile');
+ if(!b64)return;
  const r=await api('/api/import_model',{file:b64,name:n});
  document.getElementById('modelMsg').textContent=r.msg;refreshAll();}
 refreshAll();pollTrain();
+loadAIKeys();loadAISettings();
 </script></body></html>"""
 
 
@@ -1566,6 +2292,7 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1588,10 +2315,34 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if urlparse(self.path).path == "/":
             self._bytes(HTML.encode(), "text/html; charset=utf-8")
+        elif urlparse(self.path).path == "/favicon.ico":
+            with open(os.path.join(BUNDLE, "icon.ico"), "rb") as f:
+                self._bytes(f.read(), "image/x-icon")
         elif self.path == "/api/writers":
             self._json(list_writers())
+        elif urlparse(self.path).path == "/api/examples":
+            try:
+                q = parse_qs(urlparse(self.path).query)
+                writer = records.validate_writer(q.get("writer", [""])[0])
+                page = records.list_examples(
+                    writer, q.get("offset", [0])[0], q.get("limit", [20])[0])
+                items = []
+                for item in page["items"]:
+                    with Image.open(item["image_path"]) as image:
+                        image = image.convert("L")
+                        image.thumbnail((420, 120))
+                        items.append({"file": item["file"], "text": item["text"],
+                                      "img": img_to_b64(image)})
+                page["items"] = items
+                self._json(page)
+            except (ValueError, OSError) as exc:
+                self._json({"error": str(exc)}, 400)
         elif self.path == "/api/train_status":
             self._json(train_status())
+        elif self.path == "/api/ai_keys":
+            self._json({"keys": ai_correction.list_keys()})
+        elif self.path == "/api/ai_settings":
+            self._json(ai_correction.get_settings())
         elif self.path == "/api/templates/list":
             self._json(list_templates())
         elif self.path == "/api/config":
@@ -1667,17 +2418,91 @@ class Handler(BaseHTTPRequestHandler):
                 frm = int(body.get("from", 0))
                 with _jobs_lock:
                     new_lines = job["lines"][frm:]
+                    models_used = list(job["models_used"])
                 self._json({"pages_total": job["pages_total"],
                             "pages_done": job["pages_done"], "cur": job["cur"],
                             "progress": job.get("progress", 0),
                             "done": job["done"], "error": job["error"],
-                            "model": job["model"], "lines": new_lines,
+                            "model": job["model"], "models_used": models_used,
+                            "lines": new_lines,
                             "suggs": job.get("suggs") if job["done"] else None})
 
             elif self.path == "/api/save":
                 saved, quar, dups = save_lines(body["writer"], body["lines"])
                 postfix.refresh_vocab()
                 self._json({"saved": saved, "quarantined": quar, "dups": dups})
+
+            elif self.path == "/api/examples/edit":
+                if training_running():
+                    self._json({"ok": False,
+                                "msg": "אי אפשר לערוך דוגמאות בזמן אימון פעיל"}, 409)
+                    return
+                result = records.edit_example(
+                    body["writer"], body["file"], body["text"])
+                postfix.refresh_vocab()
+                self._json({"ok": True, "result": result,
+                            "msg": "הדוגמה עודכנה. עדכון המשקולות דורש אימון מחדש."})
+
+            elif self.path == "/api/examples/delete":
+                if training_running():
+                    self._json({"ok": False,
+                                "msg": "אי אפשר למחוק דוגמאות בזמן אימון פעיל"}, 409)
+                    return
+                result = records.delete_example(body["writer"], body["file"])
+                postfix.refresh_vocab()
+                self._json({"ok": True, "result": result,
+                            "msg": "הדוגמה הוסרה מנתוני האימון. המשקולות שכבר אומנו "
+                                   "אינן משתנות עד אימון מחדש או שחזור מודל."})
+
+            elif self.path == "/api/ai_keys/add":
+                keys = ai_correction.add_key(body.get("name"), body.get("key"))
+                self._json({"ok": True, "keys": keys})
+
+            elif self.path == "/api/ai_keys/remove":
+                keys = ai_correction.remove_key(body.get("id", ""))
+                self._json({"ok": True, "keys": keys})
+
+            elif self.path == "/api/ai_keys/rename":
+                key = ai_correction.rename_key(
+                    body.get("id", ""), body.get("name", ""))
+                self._json({"ok": True, "key": key})
+
+            elif self.path == "/api/ai_keys/check":
+                key_id = body.get("id")
+                if key_id:
+                    self._json({"result": ai_correction.check_key(key_id)})
+                else:
+                    self._json({"results": ai_correction.check_all_keys()})
+
+            elif self.path == "/api/ai_keys/models":
+                self._json(ai_correction.list_available_models(
+                    body.get("id", "")))
+
+            elif self.path == "/api/ai_keys/test_model":
+                self._json({"result": ai_correction.test_model(
+                    body.get("id", ""), body.get("model", ""))})
+
+            elif self.path == "/api/ai_keys/model":
+                key = ai_correction.set_key_model(
+                    body.get("id", ""), body.get("model", ""))
+                self._json({"ok": True, "key": key})
+
+            elif self.path == "/api/ai_settings":
+                settings = ai_correction.save_settings(body)
+                self._json({"ok": True, "settings": settings})
+
+            elif self.path == "/api/ai_settings/reset":
+                self._json({"ok": True,
+                            "settings": ai_correction.reset_settings()})
+
+            elif self.path == "/api/ai_correct":
+                self._json(ai_correction.correct_lines(
+                    body.get("lines"), batch_size=body.get("batch_size"),
+                    key_id=body.get("key_id"), key_name=body.get("key_name"),
+                    temperature=body.get("temperature"),
+                    top_p=body.get("top_p"), top_k=body.get("top_k"),
+                    max_output_tokens=body.get("max_output_tokens"),
+                    request_timeout=body.get("request_timeout")))
 
             elif self.path == "/api/save_fixes":
                 # מודל התיקונים: הפקת זוגות (שגוי->נכון) מהעריכות של המשתמש
@@ -1763,7 +2588,8 @@ class Handler(BaseHTTPRequestHandler):
 
             elif self.path == "/api/train":
                 ok, msg = start_training(body.get("writer") or "",
-                                         body.get("scope", "both"))
+                                         body.get("scope", "both"),
+                                         bool(body.get("resume", True)))
                 self._json({"ok": ok, "msg": msg})
 
             elif self.path == "/api/import_general":
@@ -1859,46 +2685,114 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(e)}, 500)
 
 
-def _open_window(url):
-    for path in (
-        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-        os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
-        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
-    ):
-        if os.path.exists(path):
-            subprocess.Popen([path, f"--app={url}", "--window-size=1220,880"])
-            return
-    webbrowser.open(url)
+class LocalHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = False
 
 
-def _port_free(port):
-    """בדיקת פורט אמיתית: אם אפשר להתחבר אליו — הוא תפוס.
-    (ב-Windows קשירה כפולה לא זורקת שגיאה בגלל SO_REUSEADDR, ולכן חובה לבדוק כך.)"""
-    import socket
-    with socket.socket() as s:
-        s.settimeout(0.3)
-        return s.connect_ex(("127.0.0.1", port)) != 0
+def _create_server():
+    """Use the preferred local port, then any OS-assigned free port."""
+    for candidate in (*range(PORT, PORT + 10), 0):
+        try:
+            return LocalHTTPServer(("127.0.0.1", candidate), Handler)
+        except OSError:
+            continue
+    raise OSError("לא ניתן לפתוח שרת מקומי בפורט פנוי")
+
+
+def _show_startup_error(message):
+    if os.name == "nt":
+        ctypes.windll.user32.MessageBoxW(None, message, "כתב-יד AI", 0x10)
+
+
+def _load_window_size():
+    try:
+        with open(WINDOW_SIZE_PATH, encoding="utf-8") as f:
+            size = json.load(f)
+        width, height = int(size["width"]), int(size["height"])
+        if not (800 <= width <= 10000 and 600 <= height <= 6000):
+            raise ValueError("saved window size is outside the allowed range")
+        return width, height
+    except FileNotFoundError:
+        return DEFAULT_WINDOW_SIZE
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Could not load saved window size from %s: %s",
+            WINDOW_SIZE_PATH, exc)
+        return DEFAULT_WINDOW_SIZE
+
+
+def _save_window_size(width, height):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    temporary_path = WINDOW_SIZE_PATH + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as f:
+        json.dump({"width": int(width), "height": int(height)}, f)
+    os.replace(temporary_path, WINDOW_SIZE_PATH)
+
+
+def _find_app_browser():
+    candidates = [
+        shutil.which("msedge"),
+        shutil.which("msedge.exe"),
+        shutil.which("chrome"),
+        shutil.which("chrome.exe"),
+    ]
+    for root in (os.environ.get("PROGRAMFILES"),
+                 os.environ.get("PROGRAMFILES(X86)"),
+                 os.environ.get("LOCALAPPDATA")):
+        if not root:
+            continue
+        candidates.extend((
+            os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(root, "Google", "Chrome", "Application", "chrome.exe"),
+        ))
+    return next((path for path in candidates if path and os.path.isfile(path)), None)
 
 
 def main():
+    logger = logging.getLogger("ktavyadai.startup")
     os.makedirs(WRITERS_DIR, exist_ok=True)
-    server = None
-    port = PORT
-    for port in range(PORT, PORT + 10):  # אם הפורט תפוס (מופע נוסף) — עוברים לבא
-        if not _port_free(port):
-            continue
+    try:
+        server = _create_server()
+    except OSError as exc:
+        _show_startup_error(f"לא ניתן להפעיל שרת מקומי.\n\n{exc}")
+        raise
+    url = f"http://127.0.0.1:{server.server_port}"
+    logger.info("local HTTP server listening at %s", url)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-            break
-        except OSError:
-            continue
-    if server is None:
-        return
-    url = f"http://127.0.0.1:{port}"
-    print(f"התוכנה פועלת (שרת מקומי פנימי): {url}")
-    threading.Timer(1.0, lambda: _open_window(url)).start()
-    server.serve_forever()
+            webview = importlib.import_module("webview")
+        except ModuleNotFoundError as exc:
+            if exc.name != "webview":
+                raise
+            browser = _find_app_browser()
+            if browser is None:
+                raise RuntimeError(
+                    "לא נמצא Microsoft Edge או Google Chrome לפתיחת חלון "
+                    "התוכנה. יש להתקין אחד מהם ולנסות שוב.")
+            width, height = _load_window_size()
+            logger.info("opening standalone browser app window with %s at %dx%d",
+                        browser, width, height)
+            subprocess.Popen(
+                [browser, f"--app={url}", f"--window-size={width},{height}"])
+            threading.Event().wait()
+        else:
+            width, height = _load_window_size()
+            window = webview.create_window(
+                f"כתב-יד AI {VERSION}", url, width=width, height=height,
+                min_size=(800, 600))
+            if window is None:
+                raise RuntimeError("לא ניתן ליצור את חלון התוכנה")
+            window.events.resized += _save_window_size
+            logger.info("opening embedded interface at %dx%d", width, height)
+            webview.start(gui="qt", icon=os.path.join(BUNDLE, "icon.ico"))
+    except Exception as exc:
+        _show_startup_error(f"לא ניתן להפעיל את הממשק המקומי.\n\n{exc}")
+        raise
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":

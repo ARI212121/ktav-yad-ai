@@ -11,6 +11,8 @@ models/*
 
 # ===== ארטיפקטים / סביבה =====
 dist/
+release/
+portable/
 build/
 venv/
 *.zip
@@ -22,3 +24,4 @@ otzaria_tree.json
 # ===== לא לכלול אסימונים/סודות אם ייווצרו =====
 *.clasprc.json
 .clasp.json
+check_gemini_models.py

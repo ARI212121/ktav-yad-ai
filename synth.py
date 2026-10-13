@@ -8,7 +8,7 @@ import random
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-from charset import clean, to_visual
+from charset import EXTRA, clean, to_visual
 from model import IMG_H
 
 # גופנים מועדפים — כתב יד תחילה, אחר כך גופני דפוס לגיוון
@@ -25,6 +25,8 @@ FONT_WEIGHTS = {"Guttman Yad": 6, "Guttman Yad-Brush": 6, "Guttman Yad-Light": 6
                 "Guttman Drogolin": 4, "Guttman Kav": 3, "Guttman Kav-Light": 3}
 
 _font_cache = {}
+_glyph_support_cache = {}
+SPECIAL_SYMBOLS = set(EXTRA[3:])
 
 
 def _discover_fonts():
@@ -60,6 +62,20 @@ def _load_font(path, size):
     return _font_cache[key]
 
 
+def _supports_symbols(path, symbols):
+    font = _load_font(path, 32)
+    missing = font.getmask(chr(0x10ffff))
+    for symbol in symbols:
+        key = (path, symbol)
+        if key not in _glyph_support_cache:
+            glyph = font.getmask(symbol)
+            _glyph_support_cache[key] = not (
+                glyph.size == missing.size and bytes(glyph) == bytes(missing))
+        if not _glyph_support_cache[key]:
+            return False
+    return True
+
+
 def render_line(text, rng=None):
     """מציירת שורת טקסט (בסדר לוגי) כתמונת גווני אפור בגובה IMG_H.
     מחזירה numpy array של float32 בטווח 0..1 (דיו כהה על רקע בהיר)."""
@@ -68,7 +84,13 @@ def render_line(text, rng=None):
     if not visual.strip():
         visual = "א"
     size = rng.randint(30, 46)
-    font = _load_font(rng.choice(get_fonts()), size)
+    symbols = set(visual).intersection(SPECIAL_SYMBOLS)
+    font_paths = get_fonts()
+    candidates = ([path for path in font_paths if _supports_symbols(path, symbols)]
+                  if symbols else font_paths)
+    if not candidates:
+        raise RuntimeError("No installed font supports all symbols in this sample")
+    font = _load_font(rng.choice(candidates), size)
 
     # ציור מילה-מילה עם רעידות מיקום — מדמה חוסר אחידות של כתב יד
     pad = size
@@ -222,7 +244,13 @@ def render_screen_line(text, rng=None):
     if not visual.strip():
         visual = "א"
     px = rng.randint(11, 22)
-    font = _load_font(rng.choice(get_screen_fonts()), px)
+    symbols = set(visual).intersection(SPECIAL_SYMBOLS)
+    font_paths = get_screen_fonts()
+    candidates = ([path for path in font_paths if _supports_symbols(path, symbols)]
+                  if symbols else font_paths)
+    if not candidates:
+        raise RuntimeError("No installed screen font supports all symbols in this sample")
+    font = _load_font(rng.choice(candidates), px)
     bg = rng.choice([255, 252, 248, 244, 240, 236])
     ink = rng.randint(0, 70)
     pad = max(3, px // 3)
@@ -258,6 +286,19 @@ class TextSampler:
 
     def sample(self, rng=None):
         rng = rng or random
+        if rng.random() < 0.08:
+            symbols = [
+                f"invoice_{rng.randint(1, 9999)}.pdf",
+                f"price: {rng.randint(1, 9999)} \u20aa",
+                f"cost: $ {rng.randint(1, 9999)} / {rng.randint(1, 99)}",
+                r"path: C:\data\page_1.txt",
+                "A|B < C > D {x} [y]",
+                f"\u05ea\u05e4\u05e7\u05d9\u05d3: {'_' * rng.randint(8, 24)}",
+                f"\u05e9\u05dd \u05de\u05d5\u05e8\u05e9\u05d4: {'_' * rng.randint(8, 24)}",
+                "user@example.com #100",
+                "EUR \u20ac GBP \u00a3 JPY \u00a5",
+            ]
+            return rng.choice(symbols)
         r = rng.random()
         if r < 0.55:  # שורה אמיתית מהקורפוס (או חלק ממנה)
             line = rng.choice(self.lines)
